@@ -10,11 +10,13 @@ Fonctionnement :
   - Échec d'un canal (erreur/timeout/solde) -> cooldown, bascule immédiate sur le suivant.
   - Effort : le client choisit (reasoning_effort), le routeur le transmet tel quel.
 
-Endpoints : /v1/chat/completions (stream OK) · /v1/models · /health · /state
+Endpoints : /v1/chat/completions (stream OK) · /v1/models (avec prix) · /health (uptime)
+            /state (cooldowns restants, prix marché) · /cache · /metrics (Prometheus)
+            /dashboard (HTML) · /admin/update · /admin/config · /admin/probe — --selftest
 Lancement : python router.py [--port 8791]
 Logs : router.log (console), costs.jsonl (coûts), state.json (snapshot).
 """
-import json, os, re, sys, time, threading, urllib.request, urllib.error, urllib.parse
+import json, os, re, sys, time, socket, threading, urllib.request, urllib.error, urllib.parse
 import concurrent.futures as cf
 import subprocess, atexit, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,7 +72,10 @@ TTFT_MARGIN = float(CFG.get('ttft_margin_x', 2.0))
 # dérive observée A6API : 1 USD ≈ 514 356 quota (audit global 9)
 QUOTA_PER_USD = float(CFG.get('quota_per_usd', 514356))
 
-STATE = {'models': {}, 'updated': None, 'cycles': 0, 'requests_served': 0, 'failovers': 0}
+STATE = {'models': {}, 'updated': None, 'cycles': 0, 'requests_served': 0, 'failovers': 0,
+         'savings_usd': 0.0}
+T0 = time.time()               # uptime /health
+LAST_FAIL_LOG = {}             # dédup log : (model, msg[:40]) -> ts du dernier log identique
 MKT = {}                      # model_id -> {'r': ..., 'ts': ...}
 MKT_BUSY = set()              # single-flight : modèles en cours de refresh marché
 MKT_LOCK = threading.Lock()
@@ -661,12 +666,117 @@ def on_failure(model_id, status, msg):
         COOLDOWN[model_id] = (time.time() + dur, f'{kind}: {(msg or "")[:60]}')
     with LOCK:
         streak = NET_STREAK.get(model_id, 0)
-    log(f'COOLDOWN {model_id} {dur}s ({kind} x{streak}) {str(msg)[:70]}')
+    k = (model_id, str(msg)[:40])
+    now2 = time.time()
+    with LOCK:
+        prev_ts = LAST_FAIL_LOG.get(k, 0)
+        LAST_FAIL_LOG[k] = now2
+    if now2 - prev_ts < 10:
+        log(f'COOLDOWN {model_id} {dur}s ({kind} x{streak}) (même erreur répétée, log dédupliqué)')
+    else:
+        log(f'COOLDOWN {model_id} {dur}s ({kind} x{streak}) {str(msg)[:70]}')
     with LOCK:
         STATE['failovers'] += 1
     cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'failover', 'model': model_id,
               'kind': kind, 'status': status, 'error': (msg or '')[:150]})
     return kind
+
+# ── Dashboard HTML autonome (servi sur /dashboard, fetch /state + /cache même origine) ──
+DASHBOARD_HTML = '''<!doctype html><html><head><meta charset="utf-8"><title>A6-Router</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{background:#0b1020;color:#dfe7ff;font:14px/1.45 system-ui,sans-serif;margin:0;padding:18px}
+h1{font-size:18px;margin:0 0 4px}.sub{color:#8fa3c8;margin-bottom:14px}
+table{border-collapse:collapse;width:100%;margin-bottom:18px}
+th,td{padding:6px 10px;border-bottom:1px solid #1d2a4a;text-align:left}
+th{color:#8fa3c8;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+tr.pin td:first-child{box-shadow:inset 3px 0 0 #4f7cff}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px}
+.ok{background:#123b2a;color:#5fe0a8}.cd{background:#3b1d12;color:#ff9e6e}
+.kpi{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.k{background:#111a33;border:1px solid #1d2a4a;border-radius:10px;padding:10px 14px;min-width:120px}
+.k span{color:#8fa3c8;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+.k b{display:block;font-size:19px;color:#fff;margin-top:2px}
+#err{color:#ff9e6e;margin-top:10px;display:none}
+</style></head><body>
+<h1>A6-Router <span id="v" style="color:#8fa3c8;font-size:13px"></span></h1>
+<div class="sub">meilleur prix valide en temps réel — <span id="pin"></span> · auto-refresh 10s</div>
+<div class="kpi" id="kpi"></div>
+<table><thead><tr><th>Modèle</th><th>État</th><th>TTFT EWMA</th><th>Req</th><th>Err</th><th>Coût $</th><th>Cache hit</th></tr></thead><tbody id="t"></tbody></table>
+<table><thead><tr><th>Canal (meilleur)</th><th>Entrée $/M</th><th>Sortie $/M</th><th>Succès %</th><th>Cache lecture $/M</th><th>Fournisseur</th></tr></thead><tbody id="mkt"></tbody></table>
+<div id="err"></div>
+<script>
+const kpi=(l,v)=>`<div class="k"><span>${l}</span><b>${v}</b></div>`;
+const fmt=s=>s>3600?(s/3600).toFixed(1)+'h':(s>60?Math.floor(s/60)+'min':s+'s');
+async function refresh(){try{
+ const s=await fetch('/state').then(r=>r.json());
+ let c={};try{c=await fetch('/cache').then(r=>r.json())}catch(e){}
+ document.getElementById('v').textContent='v'+(s.version||'?');
+ document.getElementById('pin').textContent=s.pin&&s.pin.model?('élu: '+s.pin.model):'élu: —';
+ document.getElementById('kpi').innerHTML=kpi('Requêtes',s.requests_served||0)+kpi('Failovers',s.failovers||0)+
+  kpi('Économies','$'+(+((s.savings_usd)||0)).toFixed(4))+kpi('Uptime',fmt(s.uptime_s||0))+
+  kpi('Cache hit',(c&&c.hit_pct_total!=null?c.hit_pct_total:0)+'%');
+ const cds=s.cooldowns||{},us=s.usage_stats||{},cm=(c&&c.models)||[];
+ let rows='';
+ for(const m of Object.keys(s.models||{})){
+  const p=(s.models[m]||{}),u=us[m]||{},cc=cm.find(x=>x.model===m);
+  const st=cds[m]?`<span class="pill cd">cooldown ${cds[m].remaining_s!=null?cds[m].remaining_s:'?'}s</span>`:`<span class="pill ok">actif</span>`;
+  rows+=`<tr class="${s.pin&&s.pin.model===m?'pin':''}"><td>${m}</td><td>${st}</td><td>${p.ttft_ewma!=null?p.ttft_ewma+'s':'—'}</td><td>${u.req||0}</td><td>${u.errs||0}</td><td>$${+(u.est_cost_usd||0).toFixed(6)}</td><td>${cc?cc.hit_pct+'%':'—'}</td></tr>`;
+ }
+ document.getElementById('t').innerHTML=rows;
+ let mrows='';
+ for(const [m,b] of Object.entries(s.market||{})){if(!b)continue;
+  mrows+=`<tr><td>${m}</td><td>${b.in!=null?b.in:'—'}</td><td>${b.out!=null?b.out:'—'}</td><td>${b.success!=null?b.success:'—'}</td><td>${b.cache_read!=null?b.cache_read:'—'}</td><td>${b.supplier||'—'}</td></tr>`;}
+ document.getElementById('mkt').innerHTML=mrows||'<tr><td colspan="6">marché en chargement…</td></tr>';
+ document.getElementById('err').style.display='none';
+}catch(e){const el=document.getElementById('err');el.style.display='block';el.textContent='erreur: '+e;}}
+refresh();setInterval(refresh,10000);
+</script></body></html>'''
+def counterfactual_max_usd(scored, tin, tout, tin_cached):
+    """Coût de CETTE requête au prix du canal le plus CHER parmi les candidats vivants.
+    Écart avec le coût réel = économie réalisée par le choix du routeur (vs pire choix)."""
+    worst = 0.0
+    tc = tin_cached or 0
+    for _, _m, b in (scored or []):
+        if not b:
+            continue
+        c = ((tin - tc) * (b.get('in') or 0) + tc * (b.get('cache_read') or 0)
+             + (tout or 0) * (b.get('out') or 0)) / 1e6
+        worst = max(worst, c)
+    return worst
+
+def selftest():
+    """Auto-vérification sans serveur (déploiement/CI) : config, clé, clé de signature,
+    bind loopback, marché. Exit 0 = prêt à démarrer."""
+    ok = True
+    try:
+        json.load(open(os.path.join(DIR, 'config.json'), encoding='utf-8'))
+        print('[OK] config.json valide')
+    except Exception as e:
+        ok = False; print('[KO] config.json:', str(e)[:80])
+    if KEY.startswith('sk-'):
+        print('[OK] clé A6API chargée')
+    else:
+        ok = False; print('[KO] clé A6API absente/incorrecte')
+    try:
+        pem = b'-----BEGIN PUBLIC KEY-----\n' + SIGN_PUB_B64.encode() + b'\n-----END PUBLIC KEY-----'
+        from cryptography.hazmat.primitives import serialization
+        serialization.load_pem_public_key(pem)
+        print('[OK] clé publique de signature parsable')
+    except Exception as e:
+        ok = False; print('[KO] clé publique signature:', str(e)[:80])
+    try:
+        s = socket.socket(); s.bind(('127.0.0.1', 0)); s.close()
+        print('[OK] bind loopback possible')
+    except Exception as e:
+        ok = False; print('[KO] bind loopback:', str(e)[:80])
+    try:
+        r = marketplace_best(MODELS[0])
+        print(f"[OK] marché {MODELS[0]}: {r.get('n_alive', 0)} canaux vivants (floor {MIN_SUCCESS}%)")
+    except Exception as e:
+        print('[WARN] marché injoignable (non bloquant):', str(e)[:60])
+    print('[SELFTEST]', 'PASS' if ok else 'FAIL')
+    sys.exit(0 if ok else 1)
 
 class Handler(BaseHTTPRequestHandler):
     server_version = 'A6Router'   # ne pas révéler BaseHTTP/Python dans les headers
@@ -690,20 +800,28 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 cds = {m: r for m, (u, r) in dict(COOLDOWN).items() if u > time.time()}
             self._json(200, {'ok': True, 'version': read_version().get('version'),
+                             'uptime_s': round(time.time() - T0),
                              'cycles': STATE.get('cycles'), 'updated': STATE.get('updated'),
                              'requests_served': STATE.get('requests_served'), 'failovers': STATE.get('failovers'),
-                             'cooldowns': cds})
+                             'savings_usd': STATE.get('savings_usd', 0.0),
+                             'pin': dict(PIN), 'cooldowns': cds})
         elif self.path == '/state':
             with MKT_LOCK:
-                mkts = {m: e['r'] for m, e in MKT.items()}
+                mkt_age = {m: round(time.time() - e['ts']) for m, e in MKT.items()}
+                mkt_best = {m: (e['r'] or {}).get('best') for m, e in MKT.items()}
             with LOCK:
-                cds = {m: {'until': time.strftime('%H:%M:%S', time.localtime(u)), 'reason': r}
+                cds = {m: {'until': time.strftime('%H:%M:%S', time.localtime(u)),
+                           'remaining_s': max(0, round(u - time.time())), 'reason': r}
                        for m, (u, r) in dict(COOLDOWN).items() if u > time.time()}
                 st = {'version': read_version().get('version'),
+                      'uptime_s': round(time.time() - T0),
                       'models': json.loads(json.dumps(STATE['models'], default=str)),
                       'usage_stats': json.loads(json.dumps(USAGE_STATS, default=str)),
                       'pin': dict(PIN),
                       'cooldowns': cds,
+                      'market_cache_age_s': mkt_age,
+                      'market': mkt_best,
+                      'savings_usd': STATE.get('savings_usd', 0.0),
                       'updated': STATE.get('updated'), 'requests_served': STATE.get('requests_served'),
                       'failovers': STATE.get('failovers')}
             self._json(200, st)
@@ -728,15 +846,76 @@ class Handler(BaseHTTPRequestHandler):
                              'hit_pct': round(100 * v.get('in_cached', 0) /
                                               max(v.get('in_cached', 0) + v.get('in_uncached', 0), 1), 1),
                              'gain_usd': round(g, 6)})
+            with LOCK:
+                savings_total = STATE.get('savings_usd', 0.0)
             self._json(200, {'models': rows, 'total_cached_tokens': tot_cached,
                              'total_uncached_tokens': tot_uncached,
                              'hit_pct_total': round(100 * tot_cached / max(tot_cached + tot_uncached, 1), 1),
-                             'gain_usd_cumule': round(gain, 6)})
+                             'gain_usd_cumule': round(gain, 6),
+                             'savings_usd_vs_pire_canal': round(savings_total, 6)})
         elif self.path == '/v1/models':
-            self._json(200, {'object': 'list', 'data': [
-                {'id': 'auto', 'object': 'model', 'created': 1626777600,
-                 'owned_by': 'a6-router: meilleur prix valide en temps reel'}] + [
-                {'id': m, 'object': 'model', 'created': 1626777600, 'owned_by': 'a6-router'} for m in MODELS]})
+            data = [{'id': 'auto', 'object': 'model', 'created': 1626777600,
+                     'owned_by': 'a6-router: meilleur prix valide en temps reel'}]
+            for m in MODELS:
+                b = ((market_get(m) or {}).get('best') or {})
+                data.append({'id': m, 'object': 'model', 'created': 1626777600, 'owned_by': 'a6-router',
+                             'pricing_usd_per_mtok': ({'input': b.get('in'), 'output': b.get('out'),
+                                                       'cache_read': b.get('cache_read'),
+                                                       'success_pct': b.get('success'),
+                                                       'supplier': b.get('supplier')} if b else None)})
+            self._json(200, {'object': 'list', 'data': data})
+        elif self.path == '/metrics':
+            # format Prometheus (text/plain) — scrape ou curl simple
+            with LOCK:
+                us_snap = json.loads(json.dumps(USAGE_STATS, default=str))
+                served = STATE.get('requests_served', 0)
+                fo = STATE.get('failovers', 0)
+                sav = STATE.get('savings_usd', 0.0)
+                cds = {m: u for m, (u, _r) in dict(COOLDOWN).items()}
+            lines = [f'a6router_requests_served_total {served}',
+                     f'a6router_failovers_total {fo}',
+                     f'a6router_savings_usd_total {sav}',
+                     f'a6router_uptime_seconds {round(time.time() - T0)}']
+            for m, v in us_snap.items():
+                lines.append(f'a6router_model_requests_total{{model="{m}"}} {v.get("req", 0)}')
+                lines.append(f'a6router_model_errors_total{{model="{m}"}} {v.get("errs", 0)}')
+                lines.append(f'a6router_model_cost_usd_total{{model="{m}"}} {v.get("est_cost_usd", 0)}')
+            for m, u in cds.items():
+                lines.append(f'a6router_cooldown_seconds{{model="{m}"}} {max(0, round(u - time.time()))}')
+            body = ('\n'.join(lines) + '\n').encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; version=0.0.4')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == '/dashboard':
+            body = DASHBOARD_HTML.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith('/admin/config'):
+            # lecture seule : config active + sha (l'écriture reste à l'auto-update signé)
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            tok = (qs.get('token') or [''])[0]
+            want = read_token()
+            if not want or tok != want:
+                self._json(403, {'error': {'message': 'token invalide'}})
+                return
+            cfg_path = os.path.join(DIR, 'config.json')
+            self._json(200, {'config': json.load(open(cfg_path, encoding='utf-8')),
+                             'sha256': sha256_file(cfg_path)})
+        elif self.path.startswith('/admin/probe'):
+            # cycle de sonde à la demande (ops) — arrière-plan, réponse immédiate
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            tok = (qs.get('token') or [''])[0]
+            want = read_token()
+            if not want or tok != want:
+                self._json(403, {'error': {'message': 'token invalide'}})
+                return
+            threading.Thread(target=probe_cycle, daemon=True).start()
+            self._json(202, {'probing': True, 'note': 'cycle de sonde lance en arriere-plan'})
         elif self.path.startswith('/admin/update'):
             # mise a jour sur demande : /admin/update?token=... (force=1 accepte un downgrade)
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -778,10 +957,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {'error': {'message': f'{tk} doit être un entier positif',
                                            'type': 'invalid_request_error', 'code': 'invalid_max_tokens'}})
                 return
+        # 'n' non supporté par les canaux A6API : 400 propre immédiat (pas de cooldown modèle)
+        n_c = payload.get('n')
+        if n_c is not None and n_c != 1:
+            self._json(400, {'error': {'message': f'n={n_c} non supporté (seul n=1) — le routeur ne duplique pas les requêtes',
+                                       'type': 'invalid_request_error', 'code': 'unsupported_n'}})
+            return
         candidates, scored = live_candidates(requested)
         if not candidates:
+            with LOCK:
+                soon = min([round(u - time.time()) for (u, _r) in dict(COOLDOWN).values()
+                            if u > time.time()] or [60])
             self._json(503, {'error': {'message': 'aucun modele disponible (cooldowns ou marche inaccessible)',
-                                       'type': 'server_error', 'code': 'no_model_available'}})
+                                       'type': 'server_error', 'code': 'no_model_available',
+                                       'hint': f'reessayez dans ~{soon}s'}})
             return
         req_id = uuid.uuid4().hex[:12]
         last_err = None
@@ -848,6 +1037,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('X-A6-Router-Model', model_id)
                 self.send_header('X-A6-Request-Id', req_id)
+                with LOCK:
+                    pin_hdr = PIN.get('model') or ''
+                self.send_header('X-A6-Router-Pin', pin_hdr)
                 self.send_header('Cache-Control', 'no-cache')
                 self.end_headers()
                 # P0 (audits obs/perf) : parser le bloc usage du FINAL des SSE —
@@ -896,7 +1088,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 tin = tout = tin_cached = None
-                est = None
+                est = sav = None
                 if usage:
                     d2 = usage.get('prompt_tokens_details') or {}
                     tin = usage.get('prompt_tokens') or usage.get('input_tokens') or 0
@@ -913,10 +1105,14 @@ class Handler(BaseHTTPRequestHandler):
                             us['in_cached'] += tin_cached
                             us['in_uncached'] += (tin - tin_cached)
                             us['est_cost_usd'] = round(us['est_cost_usd'] + (est or 0), 8)
+                            cf_usd = counterfactual_max_usd(scored, tin, tout, tin_cached)
+                            sav = round(max(0.0, cf_usd - (est or 0)), 8)
+                            STATE['savings_usd'] = round(STATE.get('savings_usd', 0.0) + sav, 8)
                 cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'request',
                           'req_id': req_id, 'model': model_id, 'stream': True,
                           'tin': tin, 'tout': tout, 'tin_cached': tin_cached,
-                          'est_cost_usd': est, 'ttft_s': round(ttft, 2) if ttft else None,
+                          'est_cost_usd': est, 'savings_usd': sav,
+                          'ttft_s': round(ttft, 2) if ttft else None,
                           'requested': requested})
                 return
             try:
@@ -934,7 +1130,7 @@ class Handler(BaseHTTPRequestHandler):
             tout = u.get('completion_tokens') or u.get('output_tokens') or 0
             tin_cached = pd.get('cached_tokens') or 0
             b = (market_get(model_id) or {}).get('best') or {}
-            est = None
+            est = sav = None
             if b:
                 cr = b.get('cache_read') or 0
                 est = round(((tin - tin_cached) * b.get('in', 0) / 1e6
@@ -944,22 +1140,32 @@ class Handler(BaseHTTPRequestHandler):
                     us['in_cached'] += tin_cached
                     us['in_uncached'] += (tin - tin_cached)
                     us['est_cost_usd'] = round(us['est_cost_usd'] + (est or 0), 8)
+                    cf_usd = counterfactual_max_usd(scored, tin, tout, tin_cached)
+                    sav = round(max(0.0, cf_usd - (est or 0)), 8)
+                    STATE['savings_usd'] = round(STATE.get('savings_usd', 0.0) + sav, 8)
             cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'request',
                       'req_id': req_id, 'model': model_id, 'stream': False,
                       'tin': tin, 'tout': tout, 'tin_cached': tin_cached,
-                      'est_cost_usd': est, 'supplier': b.get('supplier'),
+                      'est_cost_usd': est, 'savings_usd': sav, 'supplier': b.get('supplier'),
                       'requested': requested})
             d['a6_router'] = {'chosen_model': model_id, 'est_cost_usd': est,
                               'supplier': b.get('supplier'), 'requested': requested,
                               'req_id': req_id}
-            self._json(200, d, {'X-A6-Router-Model': model_id, 'X-A6-Request-Id': req_id})
+            with LOCK:
+                pin_hdr = PIN.get('model') or ''
+            self._json(200, d, {'X-A6-Router-Model': model_id, 'X-A6-Request-Id': req_id,
+                                'X-A6-Router-Pin': pin_hdr})
             return
         # tous les candidats ont échoué
         log(f'REQ {req_id} ÉCHOUÉE: {last_err}')
         cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'exhausted',
                   'req_id': req_id, 'requested': requested, 'error': str(last_err)[:150]})
+        with LOCK:
+            soon = min([round(u - time.time()) for (u, _r) in dict(COOLDOWN).values()
+                        if u > time.time()] or [60])
         self._json(502, {'error': {'message': f'tous les candidats ont echoue; derniere erreur: {last_err}',
-                                   'type': 'server_error', 'code': 'all_candidates_failed'}})
+                                   'type': 'server_error', 'code': 'all_candidates_failed',
+                                   'hint': f'reessayez dans ~{soon}s'}})
 
 class ExclusiveServer(ThreadingHTTPServer):
     # Windows : SO_REUSEADDR autorise le double-bind -> l'anti-doublon doit être un bind EXCLUSIF
@@ -992,6 +1198,8 @@ class ExclusiveServer(ThreadingHTTPServer):
             self._active_count = max(0, self._active_count - 1)
 
 def main():
+    if '--selftest' in sys.argv:
+        selftest()
     port = CFG.get('port', 8791)
     bind_host = '127.0.0.1'
     if '--port' in sys.argv:

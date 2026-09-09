@@ -1,11 +1,9 @@
 {
-  "version": "2.1.3",
-  "date": "2026-09-10",
+  "version": "2.2.0",
+  "sha256": "2386c84523bbeb4ecf91bbc9e65141a327f6259741096c6fa27d31e83068aa7d",
+  "date": "2026-09-09",
   "router_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/router.py",
-  "sha256": "9daeea0b5ccd1fd2a3cc85ee71ca12122f2be7326aa06e032506d4f60374a3c3",
   "config_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/config.json",
   "config_sha256": "366a0c59fa35a0f930134db6a700bd00931fb8f5910511a532075373c86577b9",
-  "notes": "v2.1.3: crise plateforme -> cooldown plafonne 60s",
-  "min_version": "0.9.0",
-  "signature": "q3s7C1CZcPT3SU7nV8OHiTB11ZbTjQAxd+yItUu0BPqXz39fMFB6JSHY8z1dXjc/iQ6+9agaPCc2KvJHPYq1DQ=="
+  "signature": "H3z0RcPLjjqRbV1BjWeRSv4PDnUrmCc8X5WKeOnMo/bGwMOdgFy0rK/fbQKxhax8BLTR25jKTiVarMm2N6veAw=="
 }
