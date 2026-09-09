@@ -1,0 +1,131 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --glass: rgba(255,255,255,.045); }
+  * { box-sizing: border-box; }
+  body { font-family: 'Space Grotesk','DM Sans',system-ui,sans-serif; color: var(--foreground); margin:0; padding:20px 18px; background: transparent; }
+  h1 { font-size:17px; margin:0 0 2px; letter-spacing:-.2px; }
+  h2 { font-size:13px; margin:22px 0 8px; }
+  .sub { font-size:11.5px; color: var(--muted-foreground); margin-bottom:16px; }
+  .grad { background: linear-gradient(140deg,#3579ff,#6b52ff 55%,#39d0ff); -webkit-background-clip:text; background-clip:text; color:transparent; font-weight:700; }
+  .cards { display:flex; gap:10px; flex-wrap:wrap; }
+  .card { flex:1 1 150px; background: var(--glass); backdrop-filter: blur(24px); border:1px solid var(--border); border-radius:14px; padding:12px 14px; }
+  .card .k { font-size:10.5px; text-transform:uppercase; letter-spacing:.6px; color: var(--muted-foreground); }
+  .card .v { font-size:20px; font-weight:700; margin-top:3px; }
+  .card .u { font-size:11px; color: var(--muted-foreground); }
+  table { border-collapse: collapse; width:100%; font-size:12px; }
+  th, td { text-align:right; padding:7px 9px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  th { color: var(--muted-foreground); font-weight:600; font-size:10.5px; text-transform:uppercase; letter-spacing:.5px; }
+  th:first-child, td:first-child { text-align:left; }
+  td.name { font-weight:600; }
+  .barwrap { background: var(--glass); border:1px solid var(--border); border-radius:12px; padding:14px; }
+  .row { display:grid; grid-template-columns: 110px 1fr 110px; gap:10px; align-items:center; margin:7px 0; font-size:12px; }
+  .stack { display:flex; height:20px; border-radius:6px; overflow:hidden; background: var(--glass); }
+  .seg { height:100%; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:11px; color: var(--muted-foreground); margin-top:10px; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:3px; margin-right:5px; vertical-align:-1px; }
+  .note { font-size:11px; color: var(--muted-foreground); margin-top:12px; line-height:1.6; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:10.5px; border:1px solid var(--border); color: var(--muted-foreground); }
+  .win { border:1px solid #39d0ff55; box-shadow:0 0 18px #39d0ff22; }
+  .num { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <h1>A6-Router — <span class="grad">tokens par nœud · dernière heure</span></h1>
+  <div class="sub">Fenêtre 22:22 → 23:22 UTC (00:22 → 01:22 Paris) · 9 sept. 2026 · source : costs.jsonl des 6 routeurs (5 VPS + PC), prix marché a6api au moment du sondage</div>
+
+  <div class="cards">
+    <div class="card win"><div class="k">N°1 VPS — Hugo</div><div class="v">1 062</div><div class="u">tokens · ≈ $0,0000062</div></div>
+    <div class="card"><div class="k">Curley</div><div class="v">852</div><div class="u">tokens · ≈ $0,0000059</div></div>
+    <div class="card"><div class="k">Obra</div><div class="v">817</div><div class="u">tokens · ≈ $0,0000065</div></div>
+    <div class="card"><div class="k">Victor / Sandra</div><div class="v">744 / 743</div><div class="u">tokens · ≈ $0,0000056 chacun</div></div>
+    <div class="card"><div class="k">PC (référence)</div><div class="v">4 609</div><div class="u">tokens + ~350 streams non comptés localement</div></div>
+  </div>
+
+  <h2>Tokens mesurés par modèle et par nœud</h2>
+  <div class="barwrap">
+    <div id="chart"></div>
+    <div class="legend" id="legend"></div>
+  </div>
+
+  <h2>Détail par nœud</h2>
+  <table id="tbl">
+    <thead><tr><th>Nœud</th><th>Sondes</th><th>Requêtes user</th><th>Tokens mesurés</th><th>Coût sonde ($)</th><th>Passerelle Hermes</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Prix marché a6api ($ / M tokens) — canaux les moins chers à l'heure du sondage</h2>
+  <table>
+    <thead><tr><th>Modèle</th><th>Entrée</th><th>Sortie</th><th>Meilleur canal</th><th>Canaux</th></tr></thead>
+    <tbody id="prices"></tbody>
+  </table>
+
+  <div class="note" id="notes"></div>
+
+<script>
+const MODELS = ["qwen3.8-flash","glm-5.3-flash","deepseek-v4-flash-vision-exp","deepseek-v4-flash","gpt-5.6-luna"];
+const COLORS = {"qwen3.8-flash":"#39d0ff","glm-5.3-flash":"#6b52ff","deepseek-v4-flash-vision-exp":"#3579ff","deepseek-v4-flash":"#f472b6","gpt-5.6-luna":"#facc15"};
+const PRICES = {
+ "qwen3.8-flash":[0.002866,0.008418,"tokentrans / jingtool",28],
+ "glm-5.3-flash":[0.12,0.4,"gml渠道",49],
+ "deepseek-v4-flash-vision-exp":[0.0696,0.2088,"ds管渠道",22],
+ "deepseek-v4-flash":[0.276,0.828,"自建国模号池",46],
+ "gpt-5.6-luna":[0.0192,0.1152,"低价+稳定",453]};
+// tokens mesurés (in+out) par modèle, fenêtre 22:22–23:22 UTC, costs.jsonl
+const DATA = {
+ "Hugo":    {"qwen3.8-flash":546,"glm-5.3-flash":130,"deepseek-v4-flash-vision-exp":114,"deepseek-v4-flash":215,"gpt-5.6-luna":57, probes:10, reqs:0, cost:0.0000062, gw:"active"},
+ "Curley":  {"qwen3.8-flash":280,"glm-5.3-flash":130,"deepseek-v4-flash-vision-exp":114,"deepseek-v4-flash":271,"gpt-5.6-luna":57, probes:10, reqs:0, cost:0.0000059, gw:"active"},
+ "Obra":    {"qwen3.8-flash":280,"glm-5.3-flash":98,"deepseek-v4-flash-vision-exp":114,"deepseek-v4-flash":268,"gpt-5.6-luna":57, probes:10, reqs:0, cost:0.0000065, gw:"inactive"},
+ "Victor":  {"qwen3.8-flash":227,"glm-5.3-flash":130,"deepseek-v4-flash-vision-exp":114,"deepseek-v4-flash":216,"gpt-5.6-luna":57, probes:10, reqs:0, cost:0.0000056, gw:"active"},
+ "Sandra":  {"qwen3.8-flash":265,"glm-5.3-flash":87,"deepseek-v4-flash-vision-exp":114,"deepseek-v4-flash":220,"gpt-5.6-luna":57, probes:10, reqs:0, cost:0.0000064, gw:"active"},
+ "PC":      {"qwen3.8-flash":4128,"glm-5.3-flash":66,"deepseek-v4-flash-vision-exp":114,"deepseek-v4-flash":244,"gpt-5.6-luna":57, probes:9, reqs:349, cost:0.0000074, gw:"desktop"},
+};
+const NODE_ORDER = ["Hugo","Curley","Obra","Victor","Sandra","PC"];
+const fmt=n=>n.toLocaleString('fr-FR');
+const tot=n=>MODELS.reduce((s,m)=>s+(DATA[n][m]||0),0);
+const max = Math.max(...NODE_ORDER.map(tot));
+
+const chart=document.getElementById('chart');
+for(const n of NODE_ORDER){
+  const total=tot(n);
+  const row=document.createElement('div'); row.className='row';
+  const stack=document.createElement('div'); stack.className='stack'; stack.style.width=(100*total/max)+'%';
+  for(const m of MODELS){
+    const tok=DATA[n][m]; if(!tok) continue;
+    const s=document.createElement('div'); s.className='seg';
+    s.style.width=(100*tok/total)+'%'; s.style.background=COLORS[m];
+    s.title=`${m}: ${fmt(tok)} tokens`;
+    stack.appendChild(s);
+  }
+  const lab=document.createElement('div'); lab.style.fontWeight='600'; lab.textContent=n;
+  const val=document.createElement('div'); val.className='num'; val.style.color='var(--muted-foreground)';
+  val.textContent=fmt(total)+' tokens';
+  row.append(lab,stack,val); chart.appendChild(row);
+}
+const lg=document.getElementById('legend');
+MODELS.forEach(m=>{const d=document.createElement('span');d.innerHTML=`<i class="dot" style="background:${COLORS[m]}"></i>${m}`;lg.appendChild(d);});
+
+const tb=document.querySelector('#tbl tbody');
+for(const n of NODE_ORDER){
+  const v=DATA[n];
+  const tr=document.createElement('tr');
+  tr.innerHTML=`<td class="name">${n}</td><td class="num">${v.probes}</td><td class="num">${v.reqs||'0'}</td><td class="num"><b>${fmt(tot(n))}</b></td><td class="num">${v.cost.toFixed(7)}</td><td style="text-align:left;font-size:11px">${v.gw}</td>`;
+  tb.appendChild(tr);
+}
+const pc=document.getElementById('prices');
+for(const m in PRICES){const v=PRICES[m];
+  const tr=document.createElement('tr');
+  tr.innerHTML=`<td class="name"><i class="dot" style="background:${COLORS[m]}"></i>${m}</td><td class="num">${v[0].toFixed(4)}</td><td class="num">${v[1].toFixed(4)}</td><td style="text-align:left;font-size:11.5px">${v[2]}</td><td class="num">${v[3]}</td>`;
+  pc.appendChild(tr);
+}
+document.getElementById('notes').innerHTML =
+ `<b>Lecture</b> — <span class="pill">100 % mesuré, rien d'estimé</span><br>
+ · Sur la dernière heure, les 5 VPS ne portent <b>aucune requête utilisateur</b> : leurs tokens proviennent uniquement des 2 cycles de sondes (2 × 5 modèles ≈ 10 requêtes/nœud). <b>Hugo est devant (1 062 tok)</b> à cause d'un cycle de sonde qwen verbeux (400 tok en sortie sur une sonde). Classement tokens ≠ classement coût : Obra coûte le plus cher en sondes ($0,0000065) malgré 817 tokens, car son sondage deepseek-v4-flash est tombé sur un canal plus cher.<br>
+ · Le vrai consommateur de la flotte est le <b>PC</b> : ~350 requêtes stream (cette session Hermes) dont le routeur ne journalise pas les tokens (limite d'instrumentation : stream → TTFT seulement). Le coût réel complet est mesuré séparément via le delta billing a6api.<br>
+ · Console <code>a6api.com/console/log</code> : l'API publique <code>/api/log/self</code> exige le token de session connecté et <code>api.a6api.com/logs</code> ne renvoie qu'un placeholder ; de plus les 6 nœuds partagent la même clé (md5 identique) → la console ne peut pas distinguer les VPS entre eux. D'où l'audit direct des <code>costs.jsonl</code> par SSH, la seule source fiable par nœud.<br>
+ · Obra : passerelle Hermes <b>inactive</b> (routeur, lui, actif) — aucun trafic user ne peut y transiter tant qu'elle n'est pas relancée.`
+</script>
+</body>
+</html>

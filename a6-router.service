@@ -1,0 +1,14 @@
+[Unit]
+Description=A6-Router - proxy local A6API (meilleur prix/latence par requete)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/a6-router/router.py --port 8791
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
