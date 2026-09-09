@@ -452,6 +452,13 @@ def update_helper_path():
 
 def on_failure(model_id, status, msg):
     kind = classify_error(status, msg)
+    if kind == 'params':
+        # erreur de paramètres CLIENT (payload invalide) : le modèle n'est pas en cause
+        # -> aucun cooldown, sinon 6 mauvaises requetes d'un client excluent le modele 5 min
+        log(f'PARAMS invalides (pas de cooldown modele): {str(msg)[:70]}')
+        cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'params-reject', 'model': model_id,
+                  'error': str(msg)[:150]})
+        return kind
     dur = COOLDOWN_DUR.get(kind, 120)
     if kind == 'net':
         # le modèle saoute les grosses requêtes : 90s, puis 300s, 900s, 1800s...
@@ -548,7 +555,13 @@ class Handler(BaseHTTPRequestHandler):
             if err:
                 status, msg = err
                 last_err = (status, msg)
-                on_failure(model_id, status, msg)
+                kind = on_failure(model_id, status, msg)
+                if kind == 'params':
+                    # payload du client refusé par le canal -> pas la faute du modèle,
+                    # inutile d'essayer les autres : réponse 400 immédiate
+                    self._json(400, {'error': {'message': f'parametres invalides: {str(msg)[:120]}',
+                                               'type': 'invalid_request_error', 'code': status}})
+                    return
                 continue
             # succès
             with LOCK:
