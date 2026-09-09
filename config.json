@@ -1,18 +1,14 @@
 {
-  "models": [
-    "qwen3.8-flash",
-    "glm-5.3-flash",
-    "deepseek-v4-flash-vision-exp",
-    "deepseek-v4-flash"
-  ],
-  "probe_interval_s": 1200,
+  "models": ["qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-flash"],
+  "probe_interval_s": 600,
   "market_ttl_s": 60,
-  "min_success_rate": 94,
+  "min_success_rate": 80,
   "max_latency_s": 12,
   "cooldown_s": 300,
   "cooldown_solde_s": 900,
-  "first_byte_timeout_s": 45,
-  "probe_timeout_s": 60,
+  "first_byte_timeout_s": 25,
+  "first_attempt_timeout_s": 8,
+  "probe_timeout_s": 20,
   "port": 8791,
   "update": {
     "manifest_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/manifest.json",

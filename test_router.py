@@ -3,7 +3,7 @@ import json, urllib.request, time
 tests = [
     ('Req 1 — calcul simple', 'auto', 'Calcule 27*43 et reponds juste par le nombre.'),
     ('Req 2 — salutation', 'auto', 'Dis bonjour en une phrase.'),
-    ('Req 3 — modele force', 'gpt-5.6-luna', 'Dis bonjour en une phrase.'),
+    ('Req 3 — modele force', 'glm-5.3-flash', 'Dis bonjour en une phrase.'),
     ('Req 4 — apres TTL 65s', 'auto', 'Que vaut 12*12 ?'),
 ]
 for label, model, msg in tests:

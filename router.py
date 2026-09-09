@@ -55,31 +55,57 @@ KEY = load_key()
 API_BASE = 'https://api.a6api.com'
 MKT_BASE = 'https://a6api.com/api/marketplace/public/channels/search'
 MODELS = CFG['models']
+SUCCESS_SCALE = 10000  # l'API A6API renvoie recent_success_rate sur 0-10000 (8500 = 85 %)
+MIN_SUCCESS = CFG['min_success_rate']            # 80 (0-100) — floor de fiabilité
+MIN_SUCCESS_RAW = int(MIN_SUCCESS * SUCCESS_SCALE / 100)  # 8000 (échelle API)
 
 STATE = {'models': {}, 'updated': None, 'cycles': 0, 'requests_served': 0, 'failovers': 0}
 MKT = {}                      # model_id -> {'r': ..., 'ts': ...}
+MKT_BUSY = set()              # single-flight : modèles en cours de refresh marché
 MKT_LOCK = threading.Lock()
 COOLDOWN = {}                 # model_id -> (until_ts, reason)
+NET_STREAK = {}               # échecs net consécutifs par modèle
 LOCK = threading.Lock()
+LOG_LOCK = threading.Lock()   # dédié aux I/O fichier (ne bloque jamais le chemin requête)
 
 def log(msg):
+    """Journal fichier avec rotation (~1 Mo x 3) + stdout si console existe (pythonw: silencieux)."""
     line = time.strftime('%H:%M:%S') + ' ' + str(msg)
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    try:
+        p = os.path.join(DIR, 'router.log')
+        with LOG_LOCK:
+            if os.path.exists(p) and os.path.getsize(p) > 1_000_000:
+                for old in ('.2', '.1'):
+                    prev = p + old
+                    if os.path.exists(prev):
+                        os.replace(prev, p + ('.3' if old == '.2' else '.2'))
+                os.replace(p, p + '.1')
+            with open(p, 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+    except Exception:
+        pass
 
 def cost_log(entry):
     try:
-        with LOCK:
+        with LOG_LOCK:
             with open(os.path.join(DIR, 'costs.jsonl'), 'a', encoding='utf-8') as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-    except Exception:
-        pass
+    except Exception as e:
+        try: log(f'cost_log ERR: {str(e)[:60]}')
+        except Exception: pass
 
 def save_state():
     try:
         with LOCK:
             snap = json.loads(json.dumps(STATE, default=str))
-        with open(os.path.join(DIR, 'state.json'), 'w', encoding='utf-8') as f:
+        tmp = os.path.join(DIR, 'state.json.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(snap, f, ensure_ascii=False, indent=1, default=str)
+        os.replace(tmp, os.path.join(DIR, 'state.json'))
     except Exception:
         pass
 
@@ -92,6 +118,9 @@ def in_cooldown(model_id):
 # ---------------- Marché (gratuit, TTL + refresh en fond) ----------------
 
 def marketplace_best(model_id):
+    """Meilleur canal pour un modèle : parmi les canaux vivants >= floor succès,
+    tri par COÛT ESPÉRÉ = prix_in / (succès) — un canal à 85 % qui coûte 0.0012
+    a un coût espéré de 0.0012/0.85 = 0.0014, comparable au fiable à 0.0036/1.0."""
     url = f'{MKT_BASE}?page=1&page_size=50&model={urllib.parse.quote(model_id)}&sort=price'
     r = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + KEY, 'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(r, timeout=15) as resp:
@@ -99,9 +128,13 @@ def marketplace_best(model_id):
     items = d.get('data', {}).get('items', [])
     alive = [i for i in items if not i.get('supplier_channel_disabled')
              and i.get('listing_availability') == 1
-             and i.get('recent_success_rate', 0) >= CFG['min_success_rate'] * 100
-             and i.get('sample_count', 0) >= 20]
-    alive.sort(key=lambda i: i.get('input_price_micros', 10**18))
+             and (i.get('recent_success_rate') or 0) >= MIN_SUCCESS_RAW
+             and (i.get('sample_count') or 0) >= 20]
+    # coût espéré d'entrée = prix_in * 100 / succès(%)
+    def expected_in(i):
+        s = max((i.get('recent_success_rate') or 0) / SUCCESS_SCALE, 0.01)
+        return i.get('input_price_micros', 10**18) / s
+    alive.sort(key=expected_in)
     if not alive:
         return {'best': None, 'n_alive': 0, 'total': d.get('data', {}).get('total', 0)}
     b = alive[0]
@@ -109,7 +142,7 @@ def marketplace_best(model_id):
     alts = [{'supplier': x.get('supplier_nickname'),
              'in': x.get('input_price_micros', 0) / 1e6,
              'out': x.get('output_price_micros', 0) / 1e6,
-             'success': x.get('recent_success_rate', 0) / 100,
+             'success': (x.get('recent_success_rate') or 0) / SUCCESS_SCALE * 100,
              'p50_ms': x.get('recent_p50_ms')} for x in alive[:3]]
     best = alts[0]
     return {'best': best, 'alts': alts, 'n_alive': len(alive), 'total': d.get('data', {}).get('total', 0)}
@@ -122,24 +155,33 @@ def market_get(model_id, max_age_s=None):
     if ent and (time.time() - ent['ts'] < max_age):
         return ent['r']
     if ent:
+        with MKT_LOCK:
+            if model_id in MKT_BUSY:
+                return ent['r']          # un refresh est déjà en cours — on ne spawn pas en cascade
+            MKT_BUSY.add(model_id)
         def _bg():
             try:
                 r = marketplace_best(model_id)
                 with MKT_LOCK: MKT[model_id] = {'r': r, 'ts': time.time()}
             except Exception: pass
+            finally:
+                with MKT_LOCK: MKT_BUSY.discard(model_id)
         threading.Thread(target=_bg, daemon=True).start()
         return ent['r']
     return None
 
 def warm_market():
-    """Précharge les prix en parallèle, sans ralentir le serveur."""
+    """Précharge les prix en parallèle en ARRIÈRE-PLAN (thread daemon) :
+    le serveur HTTP ne doit jamais attendre le marché au boot."""
     def get(m):
         try:
             r = marketplace_best(m)
             with MKT_LOCK: MKT[m] = {'r': r, 'ts': time.time()}
         except Exception as e: log(f'MARCHÉ {m}: {str(e)[:60]}')
-    with cf.ThreadPoolExecutor(max_workers=len(MODELS)) as ex:
-        list(ex.map(get, MODELS))
+    def _bg():
+        with cf.ThreadPoolExecutor(max_workers=len(MODELS)) as ex:
+            list(ex.map(get, MODELS))
+    threading.Thread(target=_bg, daemon=True).start()
 
 
 # ---------------- Sonde réelle (payante, minuscule) ----------------
@@ -161,7 +203,7 @@ def probe_model(model_id):
                 if not chunk:
                     break
                 out += chunk
-                if ttft is None and b'"content"' in chunk:
+                if ttft is None and b'"content"' in out:
                     ttft = time.time() - t0
             dt = time.time() - t0
         tin = tout = 0
@@ -192,12 +234,15 @@ def probe_cycle():
             continue
         mkt = market_get(model_id, max_age_s=5)
         probe = probe_model(model_id)
-        prev = STATE['models'].get(model_id, {})
-        entry = {'probe': probe, 'fails': prev.get('fails', 0), 'last_ok': prev.get('last_ok')}
+        with LOCK:
+            prev = STATE['models'].get(model_id, {})
+        entry = dict(prev)
+        entry.update({'probe': probe, 'last_probe': time.strftime('%H:%M:%S')})
         if probe.get('ok'):
             entry['fails'] = 0
             entry['last_ok'] = time.strftime('%H:%M:%S')
-            NET_STREAK.pop(model_id, None)
+            with LOCK:
+                NET_STREAK.pop(model_id, None)
             with MKT_LOCK:
                 b = ((MKT.get(model_id) or {}).get('r') or {}).get('best')
             if b:
@@ -254,24 +299,23 @@ def live_candidates(requested_model):
         # le TTFT des grosses requêtes dépend de la taille du prompt et ne doit PAS exclure
         # (sinon tout est exclu dès que la session dépasse ~10k tokens)
         probe_lat = probe.get('latency_s') or 0
-        if probe_lat > CFG['max_latency_s'] or b.get('success', 0) < CFG['min_success_rate']:
+        if probe_lat > CFG['max_latency_s'] or b.get('success', 0) < MIN_SUCCESS:
             continue
-        cost_mid = (b['in'] + b['out']) / 2
-        # SÉLECTION STRICTE : le moins cher parmi les éligibles (latence correcte = filtre)
-        cand.append((cost_mid, m, b))
+        # coût ESPÉRÉ = (in+out)/2 / succès : un canal moins fiable paie son prix divisé
+        # par sa probabilité de succès (les échecs coûtent du temps, pas des tokens)
+        success = max(float(b.get('success', 100) or 100) / 100.0, 0.01)
+        cost_expected = (b['in'] + b['out']) / 2 / success
+        cand.append((cost_expected, m, b))
     cand.sort(key=lambda x: x[0])
     if requested_model and requested_model != 'auto' and requested_model in MODELS:
-        cd, _ = in_cooldown(requested_model)
+        cd, reason = in_cooldown(requested_model)
         rest = [m for _, m, _ in cand if m != requested_model]
         if cd:
-            log(f'modele demandé {requested_model} en cooldown ({_reason_str}), candidats de secours')
+            log(f'modele demandé {requested_model} en cooldown ({reason}), candidats de secours')
             return rest, cand
         # même en cooldown fraîchement posé pendant la sélection, on essaie le demandé 1er
         return [requested_model] + rest, cand
     return [m for _, m, _ in cand], cand
-
-def _reason_str(x):
-    return str(x)
 
 # ---------------- Forward + failover ----------------
 
@@ -279,11 +323,14 @@ def normalize_payload(model_id, payload):
     """Adapte la requête au modèle choisi : effort supporté + garde-fous."""
     body = dict(payload)
     body['model'] = model_id
-    eff = (body.get('reasoning_effort') or '').lower()
+    eff = body.get('reasoning_effort')
     # les modèles économiques n'acceptent pas max/xhigh → forcer low (rapidité + coût)
-    if eff in ('max', 'xhigh'):
+    if isinstance(eff, str) and eff.lower() in ('max', 'xhigh'):
         body['reasoning_effort'] = 'low'
         body.pop('reasoning', None)
+    elif not isinstance(eff, str):
+        # champ non-string (int/bool/...) : certains canaux 400 dessus — on le retire
+        body.pop('reasoning_effort', None)
     return body
 
 def forward(model_id, payload, timeout):
@@ -325,13 +372,48 @@ def classify_error(status, msg):
 
 COOLDOWN_DUR = {'solde': CFG['cooldown_solde_s'], 'canal': CFG['cooldown_s'],
                 'params': CFG['cooldown_s'], 'rate': 60, 'net': 90}
-NET_STREAK = {}   # échecs réseau consécutifs par modèle -> cooldown progressif
+# NET_STREAK défini en tête de fichier (près de COOLDOWN), partagé par le routeur et l'auto-update
 
 # ── AUTO-UPDATE ────────────────────────────────────────────────────────────
-import hashlib, shutil
+import hashlib, shutil, base64
 UPD = CFG.get('update') or {}
 UPD_MANIFEST_URL = UPD.get('manifest_url') or 'https://raw.githubusercontent.com/Raknaos/a6-router/main/manifest.json'
 UPD_ALLOWED_HOSTS = ('raw.githubusercontent.com', 'github.com', 'objects.githubusercontent.com')
+# Clé PUBLIQUE embarquée (Ed25519) : le manifest doit être signé par la clé privée
+# détenue UNIQUEMENT par le mainteneur (jamais dans le repo). Un repo compromis ne
+# suffit plus à pousser du code : il faudrait aussi la clé privée.
+# Rotation de clé = nouvelle clé dans le code + manifest signé AVEC l'ancienne clé.
+SIGN_PUB_B64 = 'MCowBQYDK2VwAyEAbfeCEleVYP2cQyOEGVyAbtohos44ydDfaeM6M4iw7PI='
+
+def verify_manifest_sig(manifest):
+    """Vérifie la signature Ed25519 du manifest. Retourne (ok, raison).
+    Signature = sign(sha256(version|sha256|router_url)) en base64."""
+    if not SIGN_PUB_B64:
+        return True, 'pas de clé publique embarquée — vérification désactivée'
+    try:
+        sig = base64.b64decode(manifest.get('signature', ''))
+        payload = f"{manifest.get('version','')}|{manifest.get('sha256','')}|{manifest.get('router_url','')}".encode()
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.hazmat.primitives import serialization
+        pem = b'-----BEGIN PUBLIC KEY-----\n' + SIGN_PUB_B64.encode() + b'\n-----END PUBLIC KEY-----'
+        pub = serialization.load_pem_public_key(pem)
+        pub.verify(sig, payload)
+        return True, 'signature valide'
+    except Exception as e:
+        return False, f'signature invalide: {str(e)[:80]}'
+
+def sign_manifest(manifest_path):
+    """Signe le manifest local avec la clé privée du mainteneur (usage build, jamais en prod)."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    key_path = os.environ.get('A6ROUTER_SIGN_KEY') or os.path.join(
+        os.path.expanduser('~'), 'AppData', 'Local', 'hermes', 'a6router-sign-key.pem')
+    m = json.load(open(manifest_path, encoding='utf-8'))
+    payload = f"{m['version']}|{m['sha256']}|{m['router_url']}".encode()
+    priv = serialization.load_pem_private_key(open(key_path, 'rb').read(), password=None)
+    m['signature'] = base64.b64encode(priv.sign(payload)).decode()
+    json.dump(m, open(manifest_path, 'w', encoding='utf-8'), indent=2)
+    return m['signature'][:16] + '...'
 
 def read_version():
     try:
@@ -368,6 +450,11 @@ def check_update(force=False):
         man = json.loads(http_get(UPD_MANIFEST_URL, timeout=15).decode())
     except Exception as e:
         return {'updated': False, 'reason': f'manifest injoignable: {str(e)[:80]}'}
+    ok, why = verify_manifest_sig(man)
+    if not ok:
+        # manifest non signé ou signature invalide -> on refuse TOUTE écriture
+        log(f'UPDATE REFUSÉ: {why}')
+        return {'updated': False, 'reason': f'{why} — mise à jour refusée'}
     local, remote = str(ver.get('version', '0.0.0')), str(man.get('version', '0'))
     if not force and remote <= local:
         return {'updated': False, 'reason': f'a jour (local {local} / distant {remote})'}
@@ -462,9 +549,11 @@ def on_failure(model_id, status, msg):
     dur = COOLDOWN_DUR.get(kind, 120)
     if kind == 'net':
         # le modèle saoute les grosses requêtes : 90s, puis 300s, 900s, 1800s...
-        NET_STREAK[model_id] = NET_STREAK.get(model_id, 0) + 1
-        dur = min(1800, dur * (2 ** (NET_STREAK[model_id] - 1)))
-    COOLDOWN[model_id] = (time.time() + dur, f'{kind}: {(msg or "")[:60]}')
+        with LOCK:
+            NET_STREAK[model_id] = NET_STREAK.get(model_id, 0) + 1
+            dur = min(1800, dur * (2 ** (NET_STREAK[model_id] - 1)))
+    with LOCK:
+        COOLDOWN[model_id] = (time.time() + dur, f'{kind}: {(msg or "")[:60]}')
     log(f'COOLDOWN {model_id} {dur}s ({kind} x{NET_STREAK.get(model_id, 0)}) {str(msg)[:70]}')
     with LOCK:
         STATE['failovers'] += 1
@@ -473,6 +562,9 @@ def on_failure(model_id, status, msg):
     return kind
 
 class Handler(BaseHTTPRequestHandler):
+    server_version = 'A6Router'   # ne pas révéler BaseHTTP/Python dans les headers
+    sys_version = ''
+
     def log_message(self, fmt, *args):
         pass
 
@@ -488,16 +580,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/health':
+            with LOCK:
+                cds = {m: r for m, (u, r) in dict(COOLDOWN).items() if u > time.time()}
             self._json(200, {'ok': True, 'cycles': STATE.get('cycles'), 'updated': STATE.get('updated'),
                              'requests_served': STATE.get('requests_served'), 'failovers': STATE.get('failovers'),
-                             'cooldowns': {m: r for m, (u, r) in COOLDOWN.items() if u > time.time()}})
+                             'cooldowns': cds})
         elif self.path == '/state':
             with MKT_LOCK:
                 mkts = {m: e['r'] for m, e in MKT.items()}
             with LOCK:
+                cds = {m: {'until': time.strftime('%H:%M:%S', time.localtime(u)), 'reason': r}
+                       for m, (u, r) in dict(COOLDOWN).items() if u > time.time()}
                 st = {'models': json.loads(json.dumps(STATE['models'], default=str)),
-                      'cooldowns': {m: {'until': time.strftime('%H:%M:%S', time.localtime(u)), 'reason': r}
-                                    for m, (u, r) in COOLDOWN.items() if u > time.time()},
+                      'cooldowns': cds,
                       'updated': STATE.get('updated'), 'requests_served': STATE.get('requests_served'),
                       'failovers': STATE.get('failovers')}
             self._json(200, st)
@@ -525,33 +620,54 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             n = int(self.headers.get('Content-Length', 0))
+            if n > 10_000_000:  # plafond 10 Mo — 413 au lieu d'un read mémoire illimité
+                self._json(413, {'error': {'message': 'payload trop volumineux (max 10 Mo)'}})
+                return
             payload = json.loads(self.rfile.read(n).decode('utf-8'))
         except Exception as e:
             self._json(400, {'error': {'message': f'bad request: {e}'}})
             return
         requested = payload.get('model', 'auto')
+        # Compat OpenAI : un modèle inconnu (ni 'auto' ni dans MODELS) -> 404 clair,
+        # pas un 200 silencieux routé vers un autre modèle (casse les SDK)
+        if requested != 'auto' and requested not in MODELS:
+            self._json(404, {'error': {'message': f"modele '{requested}' inconnu du routeur — "
+                                                  f"utilisez 'auto' ou un de: {', '.join(MODELS)}",
+                                       'type': 'invalid_request_error', 'code': 'model_not_found'}})
+            return
+        # validation locale des limites de tokens : 400 SANS appel upstream (ni cooldown)
+        for tk in ('max_tokens', 'max_completion_tokens'):
+            v = payload.get(tk)
+            if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v <= 0):
+                self._json(400, {'error': {'message': f'{tk} doit être un entier positif',
+                                           'type': 'invalid_request_error', 'code': 'invalid_max_tokens'}})
+                return
         candidates, scored = live_candidates(requested)
         if not candidates:
             self._json(503, {'error': {'message': 'aucun modele disponible (cooldowns ou marche inaccessible)'}})
             return
         last_err = None
-        for model_id in candidates[:4]:
+        for i, model_id in enumerate(candidates[:4]):
+            # timeout PROGRESSIF : le 1er essai (candidat le moins cher espéré) est court (8 s),
+            # les suivants (failover fiables) ont le timeout complet (25 s)
+            timeout = CFG.get('first_attempt_timeout_s', 8) if i == 0 else CFG['first_byte_timeout_s']
             t_start = time.time()
-            resp, err, is_stream, _dt = forward(model_id, payload, CFG['first_byte_timeout_s'])
+            resp, err, is_stream, _dt = forward(model_id, payload, timeout)
             ttft = None
             pre = b''
             if is_stream and resp is not None:
                 # TTFT = 1er chunk SSE contenant du contenu (ignorer meta/raisonnement)
                 try:
-                    while ttft is None:
+                    while ttft is None and time.time() - t_start < timeout:
                         chunk = resp.read(512)
                         if not chunk:
                             break
                         pre += chunk
-                        if b'"content"' in chunk:
+                        # tester sur pre+chunk : le motif peut être coupé entre deux read
+                        if b'"content"' in pre:
                             ttft = time.time() - t_start
-                except Exception:
-                    pass
+                except Exception as e:
+                    err = err or (-1, f'lecture stream: {str(e)[:80]}')
             if err:
                 status, msg = err
                 last_err = (status, msg)
@@ -563,10 +679,16 @@ class Handler(BaseHTTPRequestHandler):
                                                'type': 'invalid_request_error', 'code': status}})
                     return
                 continue
+            if is_stream and ttft is None:
+                # P0 : 200 "réussi" mais AUCUN chunk de contenu (EOF ou timeout avant contenu)
+                # -> réponse vide : on bascule sur le candidat suivant, on ne sert PAS du vide
+                last_err = (-1, f'{model_id}: 200 sans contenu (EOF/timeout avant 1er token)')
+                on_failure(model_id, -1, '200 sans contenu (stream vide)')
+                continue
             # succès
             with LOCK:
                 STATE['requests_served'] += 1
-                # EWMA du TTFT réel pour ce modèle (alpha 0.3) — utilisé dans le scoring
+                # EWMA du TTFT réel pour ce modèle (alpha 0.3)
                 if ttft:
                     pe = STATE['models'].setdefault(model_id, {})
                     prev = pe.get('ttft_ewma') or ttft
@@ -628,8 +750,16 @@ class ExclusiveServer(ThreadingHTTPServer):
 
 def main():
     port = CFG.get('port', 8791)
+    bind_host = '127.0.0.1'
     if '--port' in sys.argv:
         port = int(sys.argv[sys.argv.index('--port') + 1])
+    # garde-fou sécurité : le routeur dépense la clé A6API — hors loopback interdit SAUF --expose
+    if '--expose' in sys.argv:
+        bind_host = '0.0.0.0'
+    elif any(a.startswith('--bind=') for a in sys.argv):
+        bind_host = sys.argv[[i for i, a in enumerate(sys.argv) if a.startswith('--bind=')][0]].split('=', 1)[1]
+    elif os.environ.get('A6ROUTER_BIND') == '0.0.0.0':
+        bind_host = '0.0.0.0'
     # garde anti-doublon : si une instance tourne déjà, on quitte proprement
     try:
         with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=2) as r:
@@ -644,7 +774,7 @@ def main():
             f.write(str(os.getpid()))
     except Exception:
         pass
-    log('préchargement marché en parallèle...')
+    log('préchargement marché en ARRIÈRE-PLAN (serveur démarré immédiatement)...')
     warm_market()
     threading.Thread(target=probe_loop, daemon=True).start()
     threading.Thread(target=update_loop, daemon=True).start()
@@ -652,11 +782,11 @@ def main():
     if boot_commit_or_rollback():
         threading.Timer(30.0, confirm_update).start()
     try:
-        srv = ExclusiveServer(('127.0.0.1', port), Handler)
+        srv = ExclusiveServer((bind_host, port), Handler)
     except OSError:
         log('port %d déjà pris (bind exclusif refusé) — arrêt (anti-doublon).' % port)
         return
-    log(f'A6-Router v2 sur http://127.0.0.1:{port} | modeles: {MODELS}')
+    log(f'A6-Router v{(read_version().get("version") or "?")} sur http://{bind_host}:{port} | modeles: {MODELS}')
     log(f"prix marché rafraîchis toutes les ~{CFG['market_ttl_s']}s (par requête), sondes toutes les {CFG['probe_interval_s']}s")
     log('base_url Hermes: http://127.0.0.1:%d/v1  |  model: auto' % port)
     if os.name == 'nt':
