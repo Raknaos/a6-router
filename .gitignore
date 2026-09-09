@@ -7,3 +7,6 @@ __pycache__/
 update_token.json
 version.json.bak
 router.py.bak
+sign_pub.pem
+update_helper.py
+_audits_0909/

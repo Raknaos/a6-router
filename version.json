@@ -1,6 +1,5 @@
 {
   "version": "2.0.0",
-  "date": "2026-09-10",
-  "notes": "v2.0.0: tri cout espere prix/succes, floor 80%, timeout progressif 8s/25s, stream-vide->failover, logs fichier rotatifs, 404 modele inconnu, max_tokens valide localement, signature Ed25519 manifest, locks cooldown/state atomique/single-flight marche, _reason_str fix, garde-fou bind loopback, Server header masque",
-  "router_sha256": "62cdbf6f01e318ee898a22536871ed180c87e0de36b6ead4bd210343566c6d13"
+  "router_sha256": "62cdbf6f01e318ee898a22536871ed180c87e0de36b6ead4bd210343566c6d13",
+  "date": "2026-09-10"
 }
