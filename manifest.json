@@ -1,11 +1,11 @@
 {
-  "version": "2.1.2",
+  "version": "2.1.3",
   "date": "2026-09-10",
   "router_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/router.py",
-  "sha256": "df51b6da3697531961e45c497ed76a482c429c922dfc8454472283ef7da9deb4",
+  "sha256": "9daeea0b5ccd1fd2a3cc85ee71ca12122f2be7326aa06e032506d4f60374a3c3",
   "config_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/config.json",
   "config_sha256": "366a0c59fa35a0f930134db6a700bd00931fb8f5910511a532075373c86577b9",
-  "notes": "v2.1.2: config no-op si identique",
+  "notes": "v2.1.3: crise plateforme -> cooldown plafonne 60s",
   "min_version": "0.9.0",
-  "signature": "w0CyqGhczqFkh9WRBE8xxXQZcZ+xY/Ap+3Ba3vk0xGVieS+uwfYkaWOhkHV/gmiZHVpIALvaIEWm7/gBrn5TAg=="
+  "signature": "q3s7C1CZcPT3SU7nV8OHiTB11ZbTjQAxd+yItUu0BPqXz39fMFB6JSHY8z1dXjc/iQ6+9agaPCc2KvJHPYq1DQ=="
 }

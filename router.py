@@ -76,6 +76,7 @@ MKT_BUSY = set()              # single-flight : modèles en cours de refresh mar
 MKT_LOCK = threading.Lock()
 COOLDOWN = {}                 # model_id -> (until_ts, reason)
 NET_STREAK = {}               # échecs net consécutifs par modèle
+NET_FAIL_TS = []              # timestamps des échecs net (détection de crise plateforme)
 USAGE_STATS = {}              # model_id -> {'req', 'errs', 'in_cached', 'in_uncached', 'est_cost_usd'}
 PIN = {'model': None, 'since': 0}   # hystérésis : modèle élu en cours (cache chaud)
 UPDATE_LOCK = threading.Lock()      # single-flight auto-update (update_loop × /admin)
@@ -646,6 +647,16 @@ def on_failure(model_id, status, msg):
         with LOCK:
             NET_STREAK[model_id] = NET_STREAK.get(model_id, 0) + 1
             dur = min(1800, dur * (2 ** (NET_STREAK[model_id] - 1)))
+            # CRISE PLATEFORME (leçon 14:16 : crise TLS A6API touchant TOUS les canaux à
+            # la fois -> escalade individuelle jusqu'à 503 pendant des minutes). Si >=2
+            # échecs net sur la fenêtre 120 s, c'est l'amont entier qui flanche : on
+            # plafonne le cooldown à 60 s pour récupérer dès la fin de la crise.
+            now = time.time()
+            NET_FAIL_TS.append(now)
+            while NET_FAIL_TS and now - NET_FAIL_TS[0] > 120:
+                NET_FAIL_TS.pop(0)
+            if len(NET_FAIL_TS) >= 2:
+                dur = min(dur, 60)
     with LOCK:
         COOLDOWN[model_id] = (time.time() + dur, f'{kind}: {(msg or "")[:60]}')
     with LOCK:
