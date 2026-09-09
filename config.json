@@ -13,5 +13,10 @@
   "cooldown_solde_s": 900,
   "first_byte_timeout_s": 45,
   "probe_timeout_s": 60,
-  "port": 8791
+  "port": 8791,
+  "update": {
+    "manifest_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/manifest.json",
+    "interval_h": 6,
+    "enabled": true
+  }
 }

@@ -16,6 +16,7 @@ Logs : router.log (console), costs.jsonl (coûts), state.json (snapshot).
 """
 import json, os, re, sys, time, threading, urllib.request, urllib.error, urllib.parse
 import concurrent.futures as cf
+import subprocess, atexit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -326,6 +327,129 @@ COOLDOWN_DUR = {'solde': CFG['cooldown_solde_s'], 'canal': CFG['cooldown_s'],
                 'params': CFG['cooldown_s'], 'rate': 60, 'net': 90}
 NET_STREAK = {}   # échecs réseau consécutifs par modèle -> cooldown progressif
 
+# ── AUTO-UPDATE ────────────────────────────────────────────────────────────
+import hashlib, shutil
+UPD = CFG.get('update') or {}
+UPD_MANIFEST_URL = UPD.get('manifest_url') or 'https://raw.githubusercontent.com/Raknaos/a6-router/main/manifest.json'
+UPD_ALLOWED_HOSTS = ('raw.githubusercontent.com', 'github.com', 'objects.githubusercontent.com')
+
+def read_version():
+    try:
+        return json.load(open(os.path.join(DIR, 'version.json'), encoding='utf-8'))
+    except Exception:
+        return {'version': '0.0.0', 'router_sha256': ''}
+
+def read_token():
+    try:
+        return json.load(open(os.path.join(DIR, 'update_token.json'), encoding='utf-8')).get('token', '')
+    except Exception:
+        return ''
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def http_get(url, timeout=30):
+    host = urllib.parse.urlparse(url).netloc
+    if host not in UPD_ALLOWED_HOSTS:
+        raise ValueError(f'hote non autorise: {host}')
+    req = urllib.request.Request(url, headers={'User-Agent': 'a6-router-updater'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+def check_update(force=False):
+    """Vérifie le manifest, télécharge, vérifie le sha256, remplace puis redémarre.
+    Jamais de downgrade (sauf force=1). Jamais d'écriture si le sha256 ne correspond pas."""
+    ver = read_version()
+    try:
+        man = json.loads(http_get(UPD_MANIFEST_URL, timeout=15).decode())
+    except Exception as e:
+        return {'updated': False, 'reason': f'manifest injoignable: {str(e)[:80]}'}
+    local, remote = str(ver.get('version', '0.0.0')), str(man.get('version', '0'))
+    if not force and remote <= local:
+        return {'updated': False, 'reason': f'a jour (local {local} / distant {remote})'}
+    try:
+        code = http_get(man['router_url'], timeout=30)
+    except Exception as e:
+        return {'updated': False, 'reason': f'telechargement impossible: {str(e)[:80]}'}
+    got = hashlib.sha256(code).hexdigest()
+    want = (man.get('sha256') or '').lower()
+    if not want or got != want:
+        return {'updated': False, 'reason': f'sha256 refuse ({got[:12]}...) — fichier NON modifie'}
+    path = os.path.join(DIR, 'router.py')
+    try:
+        shutil.copy2(path, os.path.join(DIR, 'router.py.bak'))
+        shutil.copy2(os.path.join(DIR, 'version.json'), os.path.join(DIR, 'version.json.bak'))
+        with open(path + '.new', 'wb') as f:
+            f.write(code)
+        json.dump({'version': remote, 'router_sha256': got, 'date': man.get('date', ''),
+                   'pending': True}, open(os.path.join(DIR, 'version.json'), 'w'), indent=2)
+        os.replace(path + '.new', path)
+    except Exception as e:
+        return {'updated': False, 'reason': f'ecriture impossible: {str(e)[:80]}'}
+    log(f'UPDATE {local} -> {remote} (sha {got[:12]}...) — redemarrage supervise')
+    cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'update', 'from': local, 'to': remote,
+              'sha256': got[:16]})
+    if os.name == 'nt':
+        # os._exit ne déclenche PAS atexit : on lance ici le helper de relance (Windows)
+        try:
+            h = update_helper_path()
+            subprocess.Popen([sys.executable, h], creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0))
+        except Exception:
+            pass  # schtasks relancera en dernier recours
+    threading.Timer(2.0, lambda: os._exit(0)).start()
+    return {'updated': True, 'from': local, 'to': remote, 'sha256': got[:16],
+            'note': 'fichier remplace; redemarrage en cours (systemd/schtasks relance)'}
+
+def boot_commit_or_rollback():
+    """Au démarrage : si version.json est 'pending', ce code est un essai.
+    On note le moment ; si main() plante, l'appelant restaure router.py.bak."""
+    ver = read_version()
+    own = sha256_file(os.path.join(DIR, 'router.py'))
+    if ver.get('pending') and own != ver.get('router_sha256'):
+        # incohérence manifest/code : on refuse de démarrer un code non vérifié
+        bak = os.path.join(DIR, 'router.py.bak')
+        if os.path.exists(bak):
+            shutil.copy2(bak, os.path.join(DIR, 'router.py'))
+            shutil.copy2(os.path.join(DIR, 'version.json.bak'), os.path.join(DIR, 'version.json'))
+            log('ROLLBACK : sha du nouveau code != manifest, version precedente restauree')
+            os._exit(1)
+    return ver.get('pending')
+
+def confirm_update():
+    """Appelé après un démarrage réussi avec version.json pending -> on valide."""
+    ver = read_version()
+    ver.pop('pending', None)
+    json.dump(ver, open(os.path.join(DIR, 'version.json'), 'w'), indent=2)
+    log(f"UPDATE confirme: v{ver.get('version')} (sha {str(ver.get('router_sha256'))[:12]}...)")
+
+def update_loop():
+    interval_h = float(UPD.get('interval_h', 6) or 6)
+    if not UPD.get('enabled', True):
+        return
+    while True:
+        time.sleep(interval_h * 3600)
+        try:
+            r = check_update()
+            if r.get('updated'):
+                log(f"auto-update: {r['from']} -> {r['to']}")
+        except Exception as e:
+            log(f'auto-update erreur: {str(e)[:80]}')
+
+def update_helper_path():
+    # Windows : pas de superviseur réactif (schtasks toutes les 5 min) -> relance dédiée
+    if os.name == 'nt':
+        helper = os.path.join(DIR, 'update_helper.py')
+        with open(helper, 'w', encoding='utf-8') as f:
+            f.write('import time, subprocess, sys, os\n'
+                    'time.sleep(3)\n'
+                    'subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "router.py")])\n')
+        return helper
+    return None  # systemd/schtasks Linux relancent nativement
+
 def on_failure(model_id, status, msg):
     kind = classify_error(status, msg)
     dur = COOLDOWN_DUR.get(kind, 120)
@@ -375,6 +499,16 @@ class Handler(BaseHTTPRequestHandler):
                 {'id': 'auto', 'object': 'model', 'created': 1626777600,
                  'owned_by': 'a6-router: meilleur prix valide en temps reel'}] + [
                 {'id': m, 'object': 'model', 'created': 1626777600, 'owned_by': 'a6-router'} for m in MODELS]})
+        elif self.path.startswith('/admin/update'):
+            # mise a jour sur demande : /admin/update?token=... (force=1 accepte un downgrade)
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            tok = (qs.get('token') or [''])[0]
+            want = read_token()
+            if not want or tok != want:
+                self._json(403, {'error': {'message': 'token invalide'}})
+                return
+            r = check_update(force=(qs.get('force') or ['0'])[0] == '1')
+            self._json(200, r)
         else:
             self._json(404, {'error': {'message': 'not found'}})
 
@@ -500,6 +634,10 @@ def main():
     log('préchargement marché en parallèle...')
     warm_market()
     threading.Thread(target=probe_loop, daemon=True).start()
+    threading.Thread(target=update_loop, daemon=True).start()
+    # essai post-update : si pending, la version sera confirmée après un serveur vivant
+    if boot_commit_or_rollback():
+        threading.Timer(30.0, confirm_update).start()
     try:
         srv = ExclusiveServer(('127.0.0.1', port), Handler)
     except OSError:
@@ -508,6 +646,11 @@ def main():
     log(f'A6-Router v2 sur http://127.0.0.1:{port} | modeles: {MODELS}')
     log(f"prix marché rafraîchis toutes les ~{CFG['market_ttl_s']}s (par requête), sondes toutes les {CFG['probe_interval_s']}s")
     log('base_url Hermes: http://127.0.0.1:%d/v1  |  model: auto' % port)
+    if os.name == 'nt':
+        # relance sans superviseur réactif : un helper détaché redémarre après os._exit
+        h = update_helper_path()
+        atexit.register(lambda: subprocess.Popen([sys.executable, h],
+                       creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0)))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
