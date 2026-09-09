@@ -1,14 +1,24 @@
 [Unit]
-Description=A6-Router - proxy local A6API (meilleur prix/latence par requete)
+Description=A6-Router (proxy OpenAI-compatible A6API)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
+# v2.1.0 (audit sécurité P0) : plus de root — compte dédié sans shell/sudo.
+# root + clé API + auto-update = pire combinaison si un maillon est compromis.
 Type=simple
+User=a6router
+Group=a6router
+WorkingDirectory=/opt/a6-router
 ExecStart=/usr/bin/python3 /opt/a6-router/router.py --port 8791
 Restart=always
 RestartSec=5
-Environment=PYTHONUNBUFFERED=1
+# durcissement (recommandations audit sécurité)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/a6-router
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

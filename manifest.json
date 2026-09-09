@@ -1,9 +1,9 @@
 {
-  "version": "2.0.0",
+  "version": "2.1.0",
   "date": "2026-09-10",
   "router_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/router.py",
-  "sha256": "62cdbf6f01e318ee898a22536871ed180c87e0de36b6ead4bd210343566c6d13",
-  "notes": "v2.0.0: tri cout espere prix/succes, floor 80%, timeout progressif 8s/25s, stream-vide->failover, logs fichier rotatifs, 404 modele inconnu, max_tokens valide localement, signature Ed25519 manifest, locks cooldown/state atomique/single-flight marche, _reason_str fix, garde-fou bind loopback, Server header masque",
+  "sha256": "d2059b2b1f56cfc36b839a18ec84aa239b13c12f6c2daadc1e7bd78d1de0907f",
+  "notes": "v2.1.0: timeout adaptatif TTFT, streams usage logue, rupture mi-stream, hysteresis pin canal, cache observabilite, market auto-repair, update single-flight, cap connexions, probing differencie",
   "min_version": "0.9.0",
-  "signature": "N0d03/aunSL93z5UwXq1Ka8vxqdfuCh82JUINUC0+GicU7sHkTY4LZoxqqTbq6LaUrEBU23frNNToeccmWbiAg=="
+  "signature": "8eYX0G0T5YAHKJA54EcHkLzE4cij02Vz+B6MdrqzBNuzntI9u3Q0tP4kMhfrYZ3+RfDtdek9nDX13X9LlUFABA=="
 }

@@ -7,7 +7,10 @@
   "cooldown_s": 300,
   "cooldown_solde_s": 900,
   "first_byte_timeout_s": 25,
-  "first_attempt_timeout_s": 8,
+  "first_attempt_min_s": 8,
+  "ttft_margin_x": 2.0,
+  "hysteresis_pct": 15,
+  "quota_per_usd": 514356,
   "probe_timeout_s": 20,
   "port": 8791,
   "update": {

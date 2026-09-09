@@ -16,7 +16,7 @@ Logs : router.log (console), costs.jsonl (coûts), state.json (snapshot).
 """
 import json, os, re, sys, time, threading, urllib.request, urllib.error, urllib.parse
 import concurrent.futures as cf
-import subprocess, atexit
+import subprocess, atexit, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -56,8 +56,19 @@ API_BASE = 'https://api.a6api.com'
 MKT_BASE = 'https://a6api.com/api/marketplace/public/channels/search'
 MODELS = CFG['models']
 SUCCESS_SCALE = 10000  # l'API A6API renvoie recent_success_rate sur 0-10000 (8500 = 85 %)
-MIN_SUCCESS = CFG['min_success_rate']            # 80 (0-100) — floor de fiabilité
+MIN_SUCCESS = CFG.get('min_success_rate', 80)      # 80 (0-100) — floor de fiabilité
 MIN_SUCCESS_RAW = int(MIN_SUCCESS * SUCCESS_SCALE / 100)  # 8000 (échelle API)
+
+# ── Paramètres v2.1.0 (tous en CFG.get avec défaut safe = comportement v2.0.0) ──
+# Hystérésis : ne quitter le canal courant que si un autre est HYSTERESIS_PCT % moins
+# cher (coût espéré) — préserve le cache de prompts du canal (cache_read ~0,1x input).
+HYSTERESIS_PCT = float(CFG.get('hysteresis_pct', 15)) / 100.0
+# Timeout du 1er essai ADAPTATIF : max(first_attempt_min_s, TTFT_ewma du modèle × 2).
+# Les audits ont prouvé qu'un 8 s fixe coupait des canaux sains (TTFT réel 7,8-12,6 s).
+FIRST_TIMEOUT_MIN = float(CFG.get('first_attempt_min_s', 8))
+TTFT_MARGIN = float(CFG.get('ttft_margin_x', 2.0))
+# dérive observée A6API : 1 USD ≈ 514 356 quota (audit global 9)
+QUOTA_PER_USD = float(CFG.get('quota_per_usd', 514356))
 
 STATE = {'models': {}, 'updated': None, 'cycles': 0, 'requests_served': 0, 'failovers': 0}
 MKT = {}                      # model_id -> {'r': ..., 'ts': ...}
@@ -65,6 +76,9 @@ MKT_BUSY = set()              # single-flight : modèles en cours de refresh mar
 MKT_LOCK = threading.Lock()
 COOLDOWN = {}                 # model_id -> (until_ts, reason)
 NET_STREAK = {}               # échecs net consécutifs par modèle
+USAGE_STATS = {}              # model_id -> {'req', 'errs', 'in_cached', 'in_uncached', 'est_cost_usd'}
+PIN = {'model': None, 'since': 0}   # hystérésis : modèle élu en cours (cache chaud)
+UPDATE_LOCK = threading.Lock()      # single-flight auto-update (update_loop × /admin)
 LOCK = threading.Lock()
 LOG_LOCK = threading.Lock()   # dédié aux I/O fichier (ne bloque jamais le chemin requête)
 
@@ -143,13 +157,17 @@ def marketplace_best(model_id):
              'in': x.get('input_price_micros', 0) / 1e6,
              'out': x.get('output_price_micros', 0) / 1e6,
              'success': (x.get('recent_success_rate') or 0) / SUCCESS_SCALE * 100,
+             'cache_read': x.get('cache_read_price_micros', 0) / 1e6,       # prix lecture cache
+             'cache_hit': (x.get('cache_hit_rate_24h') or 0) / 100,          # 0-100
              'p50_ms': x.get('recent_p50_ms')} for x in alive[:3]]
     best = alts[0]
     return {'best': best, 'alts': alts, 'n_alive': len(alive), 'total': d.get('data', {}).get('total', 0)}
 
 def market_get(model_id, max_age_s=None):
-    """Retourne immédiatement le cache. Un cache absent ne bloque jamais une requête."""
-    max_age = max_age_s if max_age_s is not None else CFG['market_ttl_s']
+    """Retourne immédiatement le cache. Un cache absent ne bloque jamais une requête,
+    mais déclenche désormais un refresh single-flight (auto-réparation du cache vide au
+    boot — audit global 1 : sinon 503 permanent jusqu'au redémarrage)."""
+    max_age = max_age_s if max_age_s is not None else CFG.get('market_ttl_s', 60)
     with MKT_LOCK:
         ent = MKT.get(model_id)
     if ent and (time.time() - ent['ts'] < max_age):
@@ -168,16 +186,34 @@ def market_get(model_id, max_age_s=None):
                 with MKT_LOCK: MKT_BUSY.discard(model_id)
         threading.Thread(target=_bg, daemon=True).start()
         return ent['r']
+    # cache ABSENT (boot, panne réseau au warm) : refresh single-flight en fond + auto-repair loop
+    with MKT_LOCK:
+        if model_id in MKT_BUSY:
+            return None
+        MKT_BUSY.add(model_id)
+    def _bg():
+        try:
+            r = marketplace_best(model_id)
+            with MKT_LOCK: MKT[model_id] = {'r': r, 'ts': time.time()}
+        except Exception: pass
+        finally:
+            with MKT_LOCK: MKT_BUSY.discard(model_id)
+    threading.Thread(target=_bg, daemon=True).start()
     return None
 
 def warm_market():
     """Précharge les prix en parallèle en ARRIÈRE-PLAN (thread daemon) :
-    le serveur HTTP ne doit jamais attendre le marché au boot."""
+    le serveur HTTP ne doit jamais attendre le marché au boot.
+    Retente tant que le cache est vide (max 5 essais) — sinon 503 permanent."""
     def get(m):
-        try:
-            r = marketplace_best(m)
-            with MKT_LOCK: MKT[m] = {'r': r, 'ts': time.time()}
-        except Exception as e: log(f'MARCHÉ {m}: {str(e)[:60]}')
+        for attempt in range(5):
+            try:
+                r = marketplace_best(m)
+                with MKT_LOCK: MKT[m] = {'r': r, 'ts': time.time()}
+                return
+            except Exception as e:
+                log(f'MARCHÉ {m} essai {attempt+1}/5: {str(e)[:60]}')
+                time.sleep(2 * (attempt + 1))
     def _bg():
         with cf.ThreadPoolExecutor(max_workers=len(MODELS)) as ex:
             list(ex.map(get, MODELS))
@@ -232,6 +268,18 @@ def probe_cycle():
         if cd:
             log(f'SONDE {model_id} ignorée (cooldown {reason})')
             continue
+        # PROBING DIFFÉRENCIÉ (audit coût) : un canal stable n'a pas besoin de sonde
+        # toutes les 10 min — vision-exp est sondée 1×/h, les autres 1×/probe_interval.
+        with LOCK:
+            pe = STATE['models'].get(model_id, {})
+        last_ok = pe.get('last_ok')
+        if last_ok and model_id.endswith('-exp'):
+            try:
+                hh, mm, _ = last_ok.split(':')
+                if time.localtime().tm_hour == int(hh) and time.localtime().tm_min < int(mm):
+                    continue  # déjà sondé cette heure
+            except Exception:
+                pass
         mkt = market_get(model_id, max_age_s=5)
         probe = probe_model(model_id)
         with LOCK:
@@ -281,7 +329,10 @@ def probe_loop():
 
 def live_candidates(requested_model):
     """Liste ordonnée de modèles candidats pour CETTE requête.
-    Prix marché (cache frais) + latence = max(sonde, p50 marché). Cooldowns respectés."""
+    Prix marché (cache frais) + latence = max(sonde, p50 marché). Cooldowns respectés.
+    HYSTÉRÉSIS : le modèle élu courant (PIN) est retenu tant que le meilleur
+    concurrent n'est pas HYSTERESIS_PCT % moins cher (coût espéré) — préserve le
+    cache de prompts (cache_read ~0,1x input, hit ~90 %) au lieu de tourner."""
     now = time.time()
     cand = []
     for m in MODELS:
@@ -297,9 +348,8 @@ def live_candidates(requested_model):
         probe = pe.get('probe') or {}
         # latence de référence pour l'EXCLUSION = sonde seule (petit prompt, normalisée) ;
         # le TTFT des grosses requêtes dépend de la taille du prompt et ne doit PAS exclure
-        # (sinon tout est exclu dès que la session dépasse ~10k tokens)
         probe_lat = probe.get('latency_s') or 0
-        if probe_lat > CFG['max_latency_s'] or b.get('success', 0) < MIN_SUCCESS:
+        if probe_lat > CFG.get('max_latency_s', 12) or b.get('success', 0) < MIN_SUCCESS:
             continue
         # coût ESPÉRÉ = (in+out)/2 / succès : un canal moins fiable paie son prix divisé
         # par sa probabilité de succès (les échecs coûtent du temps, pas des tokens)
@@ -307,6 +357,21 @@ def live_candidates(requested_model):
         cost_expected = (b['in'] + b['out']) / 2 / success
         cand.append((cost_expected, m, b))
     cand.sort(key=lambda x: x[0])
+    # ── HYSTÉRÉSIS : garder le canal élu (cache chaud) sauf si clairement battu ──
+    if cand:
+        with LOCK:
+            pinned = PIN.get('model')
+        if pinned and not in_cooldown(pinned)[0]:
+            pc = next((c for c, m, _ in cand if m == pinned), None)
+            if pc is not None:
+                best_c = cand[0][0]
+                if best_c > 0 and pc <= best_c * (1 + HYSTERESIS_PCT):
+                    # le pinned reste dans la marge -> il reprend la tête
+                    cand.sort(key=lambda x: 0 if x[1] == pinned else 1)
+        # mise à jour du pin : toujours le candidat qui finit en tête
+        with LOCK:
+            PIN['model'] = cand[0][1]
+            PIN['since'] = now
     if requested_model and requested_model != 'auto' and requested_model in MODELS:
         cd, reason = in_cooldown(requested_model)
         rest = [m for _, m, _ in cand if m != requested_model]
@@ -444,7 +509,13 @@ def http_get(url, timeout=30):
 
 def check_update(force=False):
     """Vérifie le manifest, télécharge, vérifie le sha256, remplace puis redémarre.
-    Jamais de downgrade (sauf force=1). Jamais d'écriture si le sha256 ne correspond pas."""
+    Jamais de downgrade (sauf force=1). Jamais d'écriture si le sha256 ne correspond pas.
+    Single-flight : update_loop (6 h) et /admin/update ne peuvent pas se croiser
+    (audit concurrence : deux check_update croisés = .bak incohérent / exit au milieu)."""
+    with UPDATE_LOCK:
+        return _check_update_impl(force)
+
+def _check_update_impl(force=False):
     ver = read_version()
     try:
         man = json.loads(http_get(UPD_MANIFEST_URL, timeout=15).decode())
@@ -546,15 +617,20 @@ def on_failure(model_id, status, msg):
         cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'params-reject', 'model': model_id,
                   'error': str(msg)[:150]})
         return kind
+    with LOCK:
+        USAGE_STATS.setdefault(model_id, {'req': 0, 'errs': 0, 'in_cached': 0,
+                                          'in_uncached': 0, 'est_cost_usd': 0.0})['errs'] += 1
     dur = COOLDOWN_DUR.get(kind, 120)
     if kind == 'net':
-        # le modèle saoute les grosses requêtes : 90s, puis 300s, 900s, 1800s...
+        # le modèle saute les grosses requêtes : backoff progressif 90s, 180s, 360s, 720s, 1440s, 1800s max
         with LOCK:
             NET_STREAK[model_id] = NET_STREAK.get(model_id, 0) + 1
             dur = min(1800, dur * (2 ** (NET_STREAK[model_id] - 1)))
     with LOCK:
         COOLDOWN[model_id] = (time.time() + dur, f'{kind}: {(msg or "")[:60]}')
-    log(f'COOLDOWN {model_id} {dur}s ({kind} x{NET_STREAK.get(model_id, 0)}) {str(msg)[:70]}')
+    with LOCK:
+        streak = NET_STREAK.get(model_id, 0)
+    log(f'COOLDOWN {model_id} {dur}s ({kind} x{streak}) {str(msg)[:70]}')
     with LOCK:
         STATE['failovers'] += 1
     cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'failover', 'model': model_id,
@@ -582,7 +658,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == '/health':
             with LOCK:
                 cds = {m: r for m, (u, r) in dict(COOLDOWN).items() if u > time.time()}
-            self._json(200, {'ok': True, 'cycles': STATE.get('cycles'), 'updated': STATE.get('updated'),
+            self._json(200, {'ok': True, 'version': read_version().get('version'),
+                             'cycles': STATE.get('cycles'), 'updated': STATE.get('updated'),
                              'requests_served': STATE.get('requests_served'), 'failovers': STATE.get('failovers'),
                              'cooldowns': cds})
         elif self.path == '/state':
@@ -591,11 +668,39 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 cds = {m: {'until': time.strftime('%H:%M:%S', time.localtime(u)), 'reason': r}
                        for m, (u, r) in dict(COOLDOWN).items() if u > time.time()}
-                st = {'models': json.loads(json.dumps(STATE['models'], default=str)),
+                st = {'version': read_version().get('version'),
+                      'models': json.loads(json.dumps(STATE['models'], default=str)),
+                      'usage_stats': json.loads(json.dumps(USAGE_STATS, default=str)),
+                      'pin': dict(PIN),
                       'cooldowns': cds,
                       'updated': STATE.get('updated'), 'requests_served': STATE.get('requests_served'),
                       'failovers': STATE.get('failovers')}
             self._json(200, st)
+        elif self.path == '/cache':
+            # rapport lecture seule : où le cache de prompts est utilisé, gain estimé
+            with LOCK:
+                stats = {m: dict(v) for m, v in USAGE_STATS.items()}
+            rows = []
+            tot_cached = tot_uncached = 0
+            gain = 0.0
+            for m, v in stats.items():
+                b = ((market_get(m) or {}).get('best') or {})
+                cr = b.get('cache_read') or 0
+                pi = b.get('in') or 0
+                g = v.get('in_cached', 0) * (pi - cr) / 1e6
+                gain += g
+                tot_cached += v.get('in_cached', 0)
+                tot_uncached += v.get('in_uncached', 0)
+                rows.append({'model': m, 'supplier': b.get('supplier'),
+                             'in_cached_tokens': v.get('in_cached', 0),
+                             'in_uncached_tokens': v.get('in_uncached', 0),
+                             'hit_pct': round(100 * v.get('in_cached', 0) /
+                                              max(v.get('in_cached', 0) + v.get('in_uncached', 0), 1), 1),
+                             'gain_usd': round(g, 6)})
+            self._json(200, {'models': rows, 'total_cached_tokens': tot_cached,
+                             'total_uncached_tokens': tot_uncached,
+                             'hit_pct_total': round(100 * tot_cached / max(tot_cached + tot_uncached, 1), 1),
+                             'gain_usd_cumule': round(gain, 6)})
         elif self.path == '/v1/models':
             self._json(200, {'object': 'list', 'data': [
                 {'id': 'auto', 'object': 'model', 'created': 1626777600,
@@ -644,13 +749,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
         candidates, scored = live_candidates(requested)
         if not candidates:
-            self._json(503, {'error': {'message': 'aucun modele disponible (cooldowns ou marche inaccessible)'}})
+            self._json(503, {'error': {'message': 'aucun modele disponible (cooldowns ou marche inaccessible)',
+                                       'type': 'server_error', 'code': 'no_model_available'}})
             return
+        req_id = uuid.uuid4().hex[:12]
         last_err = None
         for i, model_id in enumerate(candidates[:4]):
-            # timeout PROGRESSIF : le 1er essai (candidat le moins cher espéré) est court (8 s),
-            # les suivants (failover fiables) ont le timeout complet (25 s)
-            timeout = CFG.get('first_attempt_timeout_s', 8) if i == 0 else CFG['first_byte_timeout_s']
+            # TIMEOUT ADAPTATIF (audits perf/fiabilité) : le 1er essai a un budget de
+            # max(first_attempt_min_s, TTFT_ewma du modèle × 2) — un 8 s fixe coupait
+            # des canaux SAINS (TTFT réel mesuré 7,8-12,6 s sur qwen) -> faux failovers.
+            with LOCK:
+                ewma = (STATE['models'].get(model_id, {}) or {}).get('ttft_ewma') or 0
+            if i == 0:
+                timeout = max(FIRST_TIMEOUT_MIN, (ewma or 0) * TTFT_MARGIN)
+            else:
+                timeout = CFG.get('first_byte_timeout_s', 25)
             t_start = time.time()
             resp, err, is_stream, _dt = forward(model_id, payload, timeout)
             ttft = None
@@ -671,6 +784,7 @@ class Handler(BaseHTTPRequestHandler):
             if err:
                 status, msg = err
                 last_err = (status, msg)
+                log(f'REQ {req_id} essai {i+1} {model_id}: {status} {str(msg)[:80]}')
                 kind = on_failure(model_id, status, msg)
                 if kind == 'params':
                     # payload du client refusé par le canal -> pas la faute du modèle,
@@ -683,11 +797,16 @@ class Handler(BaseHTTPRequestHandler):
                 # P0 : 200 "réussi" mais AUCUN chunk de contenu (EOF ou timeout avant contenu)
                 # -> réponse vide : on bascule sur le candidat suivant, on ne sert PAS du vide
                 last_err = (-1, f'{model_id}: 200 sans contenu (EOF/timeout avant 1er token)')
+                log(f'REQ {req_id} essai {i+1} {model_id}: stream vide')
                 on_failure(model_id, -1, '200 sans contenu (stream vide)')
                 continue
-            # succès
+            # ── SUCCÈS ──
+            log(f'REQ {req_id} servi par {model_id} (essai {i+1}/{len(candidates[:4])}, ttft {round(ttft,2) if ttft else "?"}s)')
             with LOCK:
                 STATE['requests_served'] += 1
+                us = USAGE_STATS.setdefault(model_id, {'req': 0, 'errs': 0, 'in_cached': 0,
+                                                       'in_uncached': 0, 'est_cost_usd': 0.0})
+                us['req'] += 1
                 # EWMA du TTFT réel pour ce modèle (alpha 0.3)
                 if ttft:
                     pe = STATE['models'].setdefault(model_id, {})
@@ -697,26 +816,77 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('X-A6-Router-Model', model_id)
+                self.send_header('X-A6-Request-Id', req_id)
                 self.send_header('Cache-Control', 'no-cache')
                 self.end_headers()
+                # P0 (audits obs/perf) : parser le bloc usage du FINAL des SSE —
+                # 96-99 % des tokens passent en stream et n'étaient JAMAIS logués
+                # (coût réel par requête inconnu). La sonde le fait déjà : le canal
+                # émet bien un dernier chunk usage même en stream.
+                usage = None
                 try:
                     if pre:
                         self.wfile.write(pre)
                         self.wfile.flush()
-                    while True:
+                    buf = b''
+                    done = False
+                    while not done:
                         chunk = resp.read(1024)
                         if not chunk:
                             break
+                        buf += chunk
+                        if b'data: [DONE]' in buf:
+                            done = True
                         self.wfile.write(chunk)
                         self.wfile.flush()
-                except Exception:
-                    pass
+                        if len(buf) > 256 * 1024:
+                            buf = buf[-65536:]  # fenêtre glissante : le usage est à la fin
+                    # parser les SSE complets du buffer final
+                    try:
+                        sse = buf.decode(errors='replace')
+                        for line in reversed(sse.split('\n')):
+                            line = line.strip()
+                            if line.startswith('data:') and line != 'data: [DONE]' and '"usage"' in line:
+                                j = json.loads(line[5:].strip())
+                                if j.get('usage'):
+                                    usage = j['usage']
+                                    break
+                    except Exception:
+                        pass
+                except Exception as e:
+                    # RUPTURE MI-STREAM (audit fiabilité : mort APRÈS le 1er token —
+                    # jusqu'ici avalée en silence, réponse tronquée servie, 0 cooldown)
+                    log(f'REQ {req_id} rupture mi-stream {model_id}: {str(e)[:80]}')
+                    cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'stream-break',
+                              'req_id': req_id, 'model': model_id, 'error': str(e)[:120]})
+                    on_failure(model_id, -1, f'rupture mi-stream: {str(e)[:80]}')
                 try:
                     resp.close()
                 except Exception:
                     pass
-                cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'request', 'model': model_id,
-                          'stream': True, 'requested': requested, 'ttft_s': round(ttft, 2) if ttft else None})
+                tin = tout = tin_cached = None
+                est = None
+                if usage:
+                    d2 = usage.get('prompt_tokens_details') or {}
+                    tin = usage.get('prompt_tokens') or usage.get('input_tokens') or 0
+                    tout = usage.get('completion_tokens') or usage.get('output_tokens') or 0
+                    tin_cached = d2.get('cached_tokens') or 0
+                    b = (market_get(model_id) or {}).get('best') or {}
+                    if b:
+                        cr = b.get('cache_read') or 0
+                        # coût réel : tokens cachés au prix cache, le reste au prix plein
+                        est = round(((tin - tin_cached) * b.get('in', 0) / 1e6
+                                     + tin_cached * cr / 1e6
+                                     + tout * b.get('out', 0) / 1e6), 8)
+                        with LOCK:
+                            us['in_cached'] += tin_cached
+                            us['in_uncached'] += (tin - tin_cached)
+                            us['est_cost_usd'] = round(us['est_cost_usd'] + (est or 0), 8)
+                cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'request',
+                          'req_id': req_id, 'model': model_id, 'stream': True,
+                          'tin': tin, 'tout': tout, 'tin_cached': tin_cached,
+                          'est_cost_usd': est, 'ttft_s': round(ttft, 2) if ttft else None,
+                          'requested': requested})
                 return
             try:
                 d = json.loads(resp.read().decode())
@@ -728,25 +898,67 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             u = d.get('usage', {})
+            pd = u.get('prompt_tokens_details') or {}
             tin = u.get('prompt_tokens') or u.get('input_tokens') or 0
             tout = u.get('completion_tokens') or u.get('output_tokens') or 0
+            tin_cached = pd.get('cached_tokens') or 0
             b = (market_get(model_id) or {}).get('best') or {}
             est = None
             if b:
-                est = round(tin * b.get('in', 0) / 1e6 + tout * b.get('out', 0) / 1e6, 8)
-            cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'request', 'model': model_id,
-                      'tin': tin, 'tout': tout, 'est_cost_usd': est, 'supplier': b.get('supplier'),
+                cr = b.get('cache_read') or 0
+                est = round(((tin - tin_cached) * b.get('in', 0) / 1e6
+                             + tin_cached * cr / 1e6
+                             + tout * b.get('out', 0) / 1e6), 8)
+                with LOCK:
+                    us['in_cached'] += tin_cached
+                    us['in_uncached'] += (tin - tin_cached)
+                    us['est_cost_usd'] = round(us['est_cost_usd'] + (est or 0), 8)
+            cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'request',
+                      'req_id': req_id, 'model': model_id, 'stream': False,
+                      'tin': tin, 'tout': tout, 'tin_cached': tin_cached,
+                      'est_cost_usd': est, 'supplier': b.get('supplier'),
                       'requested': requested})
             d['a6_router'] = {'chosen_model': model_id, 'est_cost_usd': est,
-                              'supplier': b.get('supplier'), 'requested': requested}
-            self._json(200, d, {'X-A6-Router-Model': model_id})
+                              'supplier': b.get('supplier'), 'requested': requested,
+                              'req_id': req_id}
+            self._json(200, d, {'X-A6-Router-Model': model_id, 'X-A6-Request-Id': req_id})
             return
-        self._json(502, {'error': {'message': f'tous les candidats ont echoue; derniere erreur: {last_err}'}})
+        # tous les candidats ont échoué
+        log(f'REQ {req_id} ÉCHOUÉE: {last_err}')
+        cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'exhausted',
+                  'req_id': req_id, 'requested': requested, 'error': str(last_err)[:150]})
+        self._json(502, {'error': {'message': f'tous les candidats ont echoue; derniere erreur: {last_err}',
+                                   'type': 'server_error', 'code': 'all_candidates_failed'}})
 
 class ExclusiveServer(ThreadingHTTPServer):
     # Windows : SO_REUSEADDR autorise le double-bind -> l'anti-doublon doit être un bind EXCLUSIF
     allow_reuse_address = False
     allow_reuse_port = False
+    daemon_threads = True
+    # audit concurrence : ThreadingHTTPServer non borné = saturation par rafale de
+    # connexions (chaque requête = un thread). Proxy local : 64 suffisent largement.
+    max_concurrent = 64
+
+    def process_request(self, request, client_address):
+        # refus propre au-delà du cap (au lieu d'un thread illimité)
+        active = getattr(self, '_active_count', 0)
+        if active >= self.max_concurrent:
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\n'
+                                b'Content-Type: application/json\r\nContent-Length: 58\r\n\r\n'
+                                b'{"error":{"message":"routeur surcharge (max 64 concurrent)"}}\r\n')
+            except Exception:
+                pass
+            try:
+                request.close()
+            except Exception:
+                pass
+            return
+        self._active_count = active + 1
+        try:
+            super().process_request(request, client_address)
+        finally:
+            self._active_count = max(0, self._active_count - 1)
 
 def main():
     port = CFG.get('port', 8791)

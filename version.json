@@ -1,5 +1,6 @@
 {
-  "version": "2.0.0",
-  "router_sha256": "62cdbf6f01e318ee898a22536871ed180c87e0de36b6ead4bd210343566c6d13",
-  "date": "2026-09-10"
+  "version": "2.1.0",
+  "date": "2026-09-10",
+  "notes": "v2.1.0: timeout adaptatif TTFT, streams usage logue (coût reel), rupture mi-stream detectee, hysteresis 15% pin canal chaud (cache x5), marketplace cache_read/cache_hit, market cache auto-repair, /cache + usage_stats + req_id, update single-flight + cap 64 connexions, probing differencie vision-exp, erreurs OpenAI typees, CFG.get safe, service non-root a6router",
+  "router_sha256": "d2059b2b1f56cfc36b839a18ec84aa239b13c12f6c2daadc1e7bd78d1de0907f"
 }
