@@ -1,8 +1,8 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "date": "2026-09-10",
   "router_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/router.py",
-  "sha256": "cd3ce7233f1bdcbf5547403e87edde1fcf0f976540a2038d7058f12a4f06f50a",
-  "notes": "Selection strictement le moins cher parmi modeles a latence correcte ; luna retire.",
+  "sha256": "f4d3cf1bca3297ae8c6305c44d98f9886abfa04309f231b87f3d4892a68501d1",
+  "notes": "v1.1.0: auto-update securise (manifest+sha256+admin) ; v1.0.0: selection stricte moins cher",
   "min_version": "0.9.0"
 }
