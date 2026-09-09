@@ -1,6 +1,6 @@
 {
-  "version": "2.1.1",
+  "version": "2.1.2",
   "date": "2026-09-10",
-  "notes": "v2.1.1: config.json dans l auto-update (config_url+config_sha256 signés, écrit AVANT le code, JSON validé avant écriture)",
-  "router_sha256": "e026efec28821ae0403796373b8378ad2462127b672b2b9869f314a1d41ee1dc"
+  "notes": "v2.1.2: config update no-op si sha local identique (pas de réécriture inutile)",
+  "router_sha256": "df51b6da3697531961e45c497ed76a482c429c922dfc8454472283ef7da9deb4"
 }

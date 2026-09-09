@@ -531,7 +531,8 @@ def _check_update_impl(force=False):
             cfg_code = http_get(cfg_url, timeout=15)
             want_cfg = (man.get('config_sha256') or '').lower()
             got_cfg = hashlib.sha256(cfg_code).hexdigest()
-            if want_cfg and got_cfg == want_cfg:
+            local_cfg = sha256_file(os.path.join(DIR, 'config.json'))
+            if want_cfg and got_cfg == want_cfg and got_cfg != local_cfg:
                 json.loads(cfg_code.decode())  # validation JSON avant écriture
                 with open(os.path.join(DIR, 'config.json.new'), 'wb') as f:
                     f.write(cfg_code)

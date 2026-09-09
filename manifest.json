@@ -1,11 +1,11 @@
 {
-  "version": "2.1.1",
+  "version": "2.1.2",
   "date": "2026-09-10",
   "router_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/router.py",
-  "sha256": "e026efec28821ae0403796373b8378ad2462127b672b2b9869f314a1d41ee1dc",
+  "sha256": "df51b6da3697531961e45c497ed76a482c429c922dfc8454472283ef7da9deb4",
   "config_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/config.json",
   "config_sha256": "366a0c59fa35a0f930134db6a700bd00931fb8f5910511a532075373c86577b9",
-  "notes": "v2.1.1: + config.json dans l auto-update",
+  "notes": "v2.1.2: config no-op si identique",
   "min_version": "0.9.0",
-  "signature": "q8EJmTxfYFX4ZUwNB28hLqJDkOBWQFBmRG8Bx6PaDhrNHUbDtZ9RY02v1r7FImbcq90uuRIFmE4lTwg7n8mgDA=="
+  "signature": "w0CyqGhczqFkh9WRBE8xxXQZcZ+xY/Ap+3Ba3vk0xGVieS+uwfYkaWOhkHV/gmiZHVpIALvaIEWm7/gBrn5TAg=="
 }
