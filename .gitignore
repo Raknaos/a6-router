@@ -4,3 +4,6 @@ router.log
 router.pid
 state.json
 __pycache__/
+update_token.json
+version.json.bak
+router.py.bak
