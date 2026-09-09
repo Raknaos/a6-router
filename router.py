@@ -521,6 +521,25 @@ def _check_update_impl(force=False):
         man = json.loads(http_get(UPD_MANIFEST_URL, timeout=15).decode())
     except Exception as e:
         return {'updated': False, 'reason': f'manifest injoignable: {str(e)[:80]}'}
+    # CONFIG DANS L'AUTO-UPDATE (P2) : le manifest peut embarquer un config_url signé.
+    # La config est écrite AVANT le code (leçon victor) : au boot, le nouveau code lit
+    # la nouvelle config. Une config v2.x sur code v2.0.0 = no-op (clés inconnues).
+    cfg_url = man.get('config_url')
+    cfg_updated = False
+    if cfg_url:
+        try:
+            cfg_code = http_get(cfg_url, timeout=15)
+            want_cfg = (man.get('config_sha256') or '').lower()
+            got_cfg = hashlib.sha256(cfg_code).hexdigest()
+            if want_cfg and got_cfg == want_cfg:
+                json.loads(cfg_code.decode())  # validation JSON avant écriture
+                with open(os.path.join(DIR, 'config.json.new'), 'wb') as f:
+                    f.write(cfg_code)
+                os.replace(os.path.join(DIR, 'config.json.new'), os.path.join(DIR, 'config.json'))
+                cfg_updated = True
+                log(f'UPDATE config.json -> sha {got_cfg[:12]}...')
+        except Exception as e:
+            log(f'UPDATE config refusé: {str(e)[:80]}')  # on garde la config locale, on continue
     ok, why = verify_manifest_sig(man)
     if not ok:
         # manifest non signé ou signature invalide -> on refuse TOUTE écriture
@@ -548,9 +567,9 @@ def _check_update_impl(force=False):
         os.replace(path + '.new', path)
     except Exception as e:
         return {'updated': False, 'reason': f'ecriture impossible: {str(e)[:80]}'}
-    log(f'UPDATE {local} -> {remote} (sha {got[:12]}...) — redemarrage supervise')
+    log(f'UPDATE {local} -> {remote} (sha {got[:12]}...{" + config" if cfg_updated else ""}) — redemarrage supervise')
     cost_log({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': 'update', 'from': local, 'to': remote,
-              'sha256': got[:16]})
+              'sha256': got[:16], 'config': cfg_updated})
     if os.name == 'nt':
         # os._exit ne déclenche PAS atexit : on lance ici le helper de relance (Windows)
         try:

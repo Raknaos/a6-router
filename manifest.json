@@ -1,9 +1,11 @@
 {
-  "version": "2.1.0",
+  "version": "2.1.1",
   "date": "2026-09-10",
   "router_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/router.py",
-  "sha256": "d2059b2b1f56cfc36b839a18ec84aa239b13c12f6c2daadc1e7bd78d1de0907f",
-  "notes": "v2.1.0: timeout adaptatif TTFT, streams usage logue, rupture mi-stream, hysteresis pin canal, cache observabilite, market auto-repair, update single-flight, cap connexions, probing differencie",
+  "sha256": "e026efec28821ae0403796373b8378ad2462127b672b2b9869f314a1d41ee1dc",
+  "config_url": "https://raw.githubusercontent.com/Raknaos/a6-router/main/config.json",
+  "config_sha256": "366a0c59fa35a0f930134db6a700bd00931fb8f5910511a532075373c86577b9",
+  "notes": "v2.1.1: + config.json dans l auto-update",
   "min_version": "0.9.0",
-  "signature": "8eYX0G0T5YAHKJA54EcHkLzE4cij02Vz+B6MdrqzBNuzntI9u3Q0tP4kMhfrYZ3+RfDtdek9nDX13X9LlUFABA=="
+  "signature": "q8EJmTxfYFX4ZUwNB28hLqJDkOBWQFBmRG8Bx6PaDhrNHUbDtZ9RY02v1r7FImbcq90uuRIFmE4lTwg7n8mgDA=="
 }
