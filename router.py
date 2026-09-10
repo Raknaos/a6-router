@@ -184,6 +184,44 @@ def market30_get(model_id):
             'maj_s': round(time.time() - os.stat(MKT30_FILE).st_mtime)}
 
 
+def shared_probes_age():
+    """Âge de la dernière fournée de sondes PARTAGÉES (None si jamais publiée).
+    Le sondeur unique (worker marché du VPS .66) publie ses résultats dans le
+    payload /api/prices ; le pull SSH les ramène avec les prix 30 j."""
+    try:
+        with open(MKT30_FILE, encoding='utf-8') as fh:
+            d = json.load(fh)
+    except Exception:
+        return None
+    g = (d.get('probes') or {}).get('generated_at')
+    try:
+        return (time.time() - float(g)) if g else None
+    except Exception:
+        return None
+
+
+def shared_probe(model_id):
+    """Sonde publiée par le sondeur unique de la flotte, si encore fraîche.
+    Un test fait par une seule machine sert TOUT LE MONDE : le volume de sondes
+    ne dépend plus du nombre de nœuds (et donc plus du nombre d'utilisateurs)."""
+    try:
+        age_max = float(CFG.get('probe_share_max_age_s', 1500))
+        with open(MKT30_FILE, encoding='utf-8') as fh:
+            d = json.load(fh)
+    except Exception:
+        return None
+    p = (d.get('probes') or {}).get('models', {}).get(model_id)
+    if not isinstance(p, dict) or not p.get('ts'):
+        return None
+    try:
+        age = time.time() - float(p['ts'])
+    except Exception:
+        return None
+    if age > age_max:
+        return None
+    return p, age
+
+
 def marketplace_best(model_id):
     """Meilleur canal pour un modèle : parmi les canaux vivants >= floor succès,
     tri par COÛT ESPÉRÉ = prix_in / (succès) — un canal à 85 % qui coûte 0.0012
@@ -336,7 +374,40 @@ def probe_cycle():
                     continue  # déjà sondé cette heure
             except Exception:
                 pass
-        mkt = market_get(model_id, max_age_s=5)
+        # ── SONDE PARTAGÉE (10-09) : un SEUL test sert toute la flotte ──
+        # Le worker du VPS .66 sonde chaque modèle toutes les 20 min et publie le
+        # résultat, ramené par le pull SSH (market30_vps.json → probes). Tant que
+        # la sonde partagée est fraîche on la réutilise telle quelle : zéro appel
+        # payant, même latence de référence pour tous, canal stable (cache intact).
+        sp = shared_probe(model_id)
+        if sp:
+            probe, age = sp
+            with LOCK:
+                prev = STATE['models'].get(model_id, {})
+            entry = dict(prev)
+            entry.update({'probe': probe, 'last_probe': time.strftime('%H:%M:%S'),
+                          'probe_src': 'shared', 'probe_age_s': round(age)})
+            if probe.get('ok'):
+                entry['fails'] = 0
+                entry['last_ok'] = time.strftime('%H:%M:%S')
+                with LOCK:
+                    NET_STREAK.pop(model_id, None)
+            else:
+                entry['fails'] = prev.get('fails', 0) + 1
+                entry['last_error'] = (probe.get('error') or '')[:120]
+            with LOCK:
+                STATE['models'][model_id] = entry
+            save_state()
+            log(f"SONDE {model_id:30s} réutilisée (partagée, âge {round(age)}s)")
+            continue
+        # Partage indisponible : un nœud 'reader' N'ENVOIE PAS de test payant
+        # (sinon on retombe sur N nœuds × 1 sonde). Il n'arme le repli local que
+        # si le sondeur partagé est muet depuis probe_fallback_s (défaut 1 h).
+        if CFG.get('probe_role', 'reader') == 'reader':
+            age_share = shared_probes_age()
+            if age_share is None or age_share < float(CFG.get('probe_fallback_s', 3600)):
+                log(f'SONDE {model_id} sautée (partage indisponible, repli non armé)')
+                continue
         probe = probe_model(model_id)
         with LOCK:
             prev = STATE['models'].get(model_id, {})
@@ -417,21 +488,31 @@ def live_candidates(requested_model):
             cost_expected = (b['in'] + b['out']) / 2 / success
         cand.append((cost_expected, m, b))
     cand.sort(key=lambda x: x[0])
-    # ── HYSTÉRÉSIS : garder le canal élu (cache chaud) sauf si clairement battu ──
+    # ── HYSTÉRÉSIS + RETENUE MINIMALE : le cache de prompts vaut plus qu'un gain
+    #    de quelques pourcents. On garde le canal élu ; pendant pin_min_hold_s
+    #    (défaut 6 h) seule une alternative BEAUCOUP moins chère (pin_switch_pct,
+    #    défaut 50 %) ou la mort du canal justifie de changer de modèle/fournisseur.
     if cand:
         with LOCK:
             pinned = PIN.get('model')
+            since = PIN.get('since') or 0
         if pinned and not in_cooldown(pinned)[0]:
             pc = next((c for c, m, _ in cand if m == pinned), None)
             if pc is not None:
                 best_c = cand[0][0]
-                if best_c > 0 and pc <= best_c * (1 + HYSTERESIS_PCT):
+                marge = HYSTERESIS_PCT
+                hold = float(CFG.get('pin_min_hold_s', 0) or 0)
+                if hold and (now - since) < hold:
+                    marge = max(marge, float(CFG.get('pin_switch_pct', 50) or 50) / 100.0)
+                if best_c > 0 and pc <= best_c * (1 + marge):
                     # le pinned reste dans la marge -> il reprend la tête
                     cand.sort(key=lambda x: 0 if x[1] == pinned else 1)
-        # mise à jour du pin : toujours le candidat qui finit en tête
+        # mise à jour du pin ; `since` ne bouge QUE si le modèle change (sinon la
+        # retenue minimale se réarmait à chaque requête et ne protégeait rien)
         with LOCK:
+            if PIN.get('model') != cand[0][1]:
+                PIN['since'] = now
             PIN['model'] = cand[0][1]
-            PIN['since'] = now
     if requested_model and requested_model != 'auto' and requested_model in MODELS:
         cd, reason = in_cooldown(requested_model)
         rest = [m for _, m, _ in cand if m != requested_model]
@@ -1367,7 +1448,9 @@ def main():
                 pass
             time.sleep(1)
     log(f'A6-Router v{(read_version().get("version") or "?")} sur http://{bind_host}:{port} | modeles: {MODELS}')
-    log(f"prix marché rafraîchis toutes les ~{CFG['market_ttl_s']}s (par requête), sondes toutes les {CFG['probe_interval_s']}s")
+    log(f"prix marché rafraîchis toutes les ~{CFG['market_ttl_s']}s | sondes PARTAGÉES "
+        f"(sondeur unique du VPS .66, fraîcheur max {CFG.get('probe_share_max_age_s', 1500)}s) "
+        f"| repli local seulement si le partage est muet depuis {CFG.get('probe_fallback_s', 3600)}s")
     log('base_url Hermes: http://127.0.0.1:%d/v1  |  model: auto' % port)
     if os.name == 'nt':
         # relance sans superviseur réactif : un helper détaché redémarre après os._exit
