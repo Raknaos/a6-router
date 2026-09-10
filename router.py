@@ -137,10 +137,60 @@ def in_cooldown(model_id):
 
 # ---------------- Marché (gratuit, TTL + refresh en fond) ----------------
 
+# ── Source 30 JOURS (worker VPS Quota.Hub, `GET /api/prices`, pull SSH 2 min) ──
+# Le meilleur canal par modèle est choisi sur la MOYENNE 30 J PONDÉRÉE PAR LE TEMPS,
+# pas sur le prix instantané (qui vaut 4x son prix réel juste après une hausse).
+# Le worker applique déjà les seuils (pire heure >= 90 %, volume 24 h >= 200) :
+# ses entrées `top` sont donc directement éligibles, et les 5 premières forment le
+# panneau épinglé du modèle. Instantané = repli si l'instantané est absent/périmé.
+MKT30_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'market30_vps.json')
+
+
+def market30_get(model_id):
+    """Vue marché 30 j pour un modèle, ou None si absente/périmée."""
+    try:
+        age_max = float(CFG.get('market30_max_age_s', 900))
+        if time.time() - os.stat(MKT30_FILE).st_mtime > age_max:
+            return None
+        with open(MKT30_FILE, encoding='utf-8') as fh:
+            d = json.load(fh)
+    except Exception:
+        return None
+    ent = (d.get('models') or {}).get(model_id) or {}
+    top = ent.get('top') or []
+    if not top:
+        return None
+
+    def conv(x):
+        return {
+            'supplier': x.get('supplier'),
+            'channel_id': x.get('channel_id'),
+            # prix INSTANTANÉS : servent à la comptabilisation du coût réel de la requête
+            'in': x.get('in_now', 0), 'out': x.get('out_now', 0),
+            'cache_read': x.get('cache_now', 0),
+            'success': x.get('sr24', 0),
+            'cache_hit': (x.get('cache') or 0) / 100.0,
+            'p50_ms': x.get('ttft_ms'),
+            # moyennes 30 j : servent à la DÉCISION (coût espéré)
+            'in30': x.get('in_30', 0), 'out30': x.get('out_30', 0),
+            'cache30': x.get('cache_30', 0), 'cost30': x.get('cost30'),
+            'worst': x.get('worst'), 'n24': x.get('n24'),
+            'jours_chg': x.get('days_since_change'), 'src': 'moy30',
+        }
+
+    lst = [conv(x) for x in top[:5]]
+    return {'best': lst[0], 'alts': lst[1:], 'n_alive': ent.get('n_robust', len(lst)),
+            'total': ent.get('n_listings', 0), 'src': 'moy30',
+            'maj_s': round(time.time() - os.stat(MKT30_FILE).st_mtime)}
+
+
 def marketplace_best(model_id):
     """Meilleur canal pour un modèle : parmi les canaux vivants >= floor succès,
     tri par COÛT ESPÉRÉ = prix_in / (succès) — un canal à 85 % qui coûte 0.0012
     a un coût espéré de 0.0012/0.85 = 0.0014, comparable au fiable à 0.0036/1.0."""
+    m30 = market30_get(model_id)
+    if m30:
+        return m30
     url = f'{MKT_BASE}?page=1&page_size=50&model={urllib.parse.quote(model_id)}&sort=price'
     r = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + KEY, 'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(r, timeout=15) as resp:
@@ -360,7 +410,11 @@ def live_candidates(requested_model):
         # coût ESPÉRÉ = (in+out)/2 / succès : un canal moins fiable paie son prix divisé
         # par sa probabilité de succès (les échecs coûtent du temps, pas des tokens)
         success = max(float(b.get('success', 100) or 100) / 100.0, 0.01)
-        cost_expected = (b['in'] + b['out']) / 2 / success
+        # DÉCISION sur la moyenne 30 j (source Quota.Hub fraîche) ; sinon marché instantané
+        if b.get('cost30'):
+            cost_expected = b['cost30'] / success
+        else:
+            cost_expected = (b['in'] + b['out']) / 2 / success
         cand.append((cost_expected, m, b))
     cand.sort(key=lambda x: x[0])
     # ── HYSTÉRÉSIS : garder le canal élu (cache chaud) sauf si clairement battu ──
@@ -1006,7 +1060,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not b:
                         continue
                     s_ok = max(float(b.get('success', 100) or 100) / 100.0, 0.01)
-                    lr.append(((b.get('in', 0) + b.get('out', 0)) / 2 / s_ok, m))
+                    base = b['cost30'] if b.get('cost30') else (b.get('in', 0) + b.get('out', 0)) / 2
+                    lr.append((base / s_ok, m))
                 lr.sort(key=lambda x: x[0])
                 if not lr:
                     # marché totalement indisponible : on tente quand même le canal élu

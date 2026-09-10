@@ -9,4 +9,6 @@ version.json.bak
 router.py.bak
 sign_pub.pem
 update_helper.py
+market30_vps.json
+market30_pull.log
 _audits_0909/
