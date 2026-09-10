@@ -12,6 +12,7 @@
   "cooldown_s": 120,
   "cooldown_solde_s": 900,
   "cooldown_wait_max_s": 30,
+  "bind_wait_s": 20,
   "first_byte_timeout_s": 45,
   "first_attempt_min_s": 20,
   "ttft_margin_x": 2.5,

@@ -974,13 +974,27 @@ class Handler(BaseHTTPRequestHandler):
             wait_max = float(CFG.get('cooldown_wait_max_s', 30) or 30)
             t_dead = time.time() + wait_max
             while not candidates:
+                if time.time() >= t_dead:
+                    break
                 with LOCK:
                     ups = [u for (u, _r) in dict(COOLDOWN).values() if u > time.time()]
                     soon = min([u - time.time() for u in ups] or [wait_max + 1])
-                if not ups or soon > wait_max or time.time() >= t_dead:
+                with MKT_LOCK:
+                    has_mkt = any(m in MKT for m in MODELS)
+                # Rien en cooldown ET marché chargé => refus légitime (aucun canal
+                # n'atteint le floor de succès) : inutile d'attendre.
+                if not ups and has_mkt:
                     break
-                log(f'ATTENTE cooldown {round(soon, 1)}s avant nouvel essai (anti-503-instantane)')
-                time.sleep(min(max(soon, 0.25), 5.0))
+                if ups and soon > wait_max:
+                    break
+                if ups:
+                    log(f'ATTENTE cooldown {round(soon, 1)}s avant nouvel essai (anti-503-instantane)')
+                    time.sleep(min(max(soon, 0.5), 3.0))
+                else:
+                    # v2.2.2 : boot/panne marché — le cache de prix n'est pas encore
+                    # chargé (constaté sur Obra après chaque redémarrage : 503 en 1 ms).
+                    log('ATTENTE du marché (cache de prix vide) avant refus')
+                    time.sleep(1.0)
                 candidates, scored = live_candidates(requested)
             if not candidates:
                 # DERNIER RECOURS : le canal le moins cher malgré son cooldown — un essai
@@ -994,10 +1008,13 @@ class Handler(BaseHTTPRequestHandler):
                     s_ok = max(float(b.get('success', 100) or 100) / 100.0, 0.01)
                     lr.append(((b.get('in', 0) + b.get('out', 0)) / 2 / s_ok, m))
                 lr.sort(key=lambda x: x[0])
-                if lr:
-                    candidates = [lr[0][1]]
-                    scored = []
-                    log(f'DERNIER RECOURS {lr[0][1]} (cooldown ignoré) — essai unique')
+                if not lr:
+                    # marché totalement indisponible : on tente quand même le canal élu
+                    with LOCK:
+                        lr = [(0.0, (PIN.get('model') or MODELS[0]))]
+                candidates = [lr[0][1]]
+                scored = []
+                log(f'DERNIER RECOURS {candidates[0]} (cooldown/marché ignorés) — essai unique')
             if not candidates:
                 with LOCK:
                     soon = min([round(u - time.time()) for (u, _r) in dict(COOLDOWN).values()
@@ -1266,11 +1283,34 @@ def main():
     # essai post-update : si pending, la version sera confirmée après un serveur vivant
     if boot_commit_or_rollback():
         threading.Timer(30.0, confirm_update).start()
-    try:
-        srv = ExclusiveServer((bind_host, port), Handler)
-    except OSError:
-        log('port %d déjà pris (bind exclusif refusé) — arrêt (anti-doublon).' % port)
-        return
+    # ── v2.2.2 : BIND avec REPRISE + SORTIE DURE ─────────────────────────────────
+    # Constaté le 10-09 (Victor/Obra/Hugo) : après un auto-update, la nouvelle instance
+    # démarre PENDANT que l'ancienne ferme son socket -> bind refusé -> « arrêt
+    # (anti-doublon) » ; mais les threads du pool de préchargement marché (non-daemon)
+    # maintenaient le process VIVANT sans port : systemd affichait « active » alors que
+    # le routeur était MUET (chat http=000/503, NRestarts 3→11). Fix : on RETENTE le
+    # bind pendant bind_wait_s, puis SORTIE DURE (os._exit) — l'anti-doublon reste
+    # strict, mais plus aucun process ne peut survivre sans socket.
+    bind_wait = float(CFG.get('bind_wait_s', 20) or 20)
+    srv, t_bind, n_try = None, time.time(), 0
+    while srv is None:
+        try:
+            srv = ExclusiveServer((bind_host, port), Handler)
+        except OSError as e:
+            n_try += 1
+            if time.time() - t_bind >= bind_wait:
+                log('port %d toujours pris après %.0fs (%d essais) — SORTIE DURE (anti-doublon)'
+                    % (port, bind_wait, n_try))
+                os._exit(3)
+            log('bind %d refusé (%s) — nouvelle tentative dans 1s' % (port, str(e)[:50]))
+            try:
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=2) as r:
+                    if json.loads(r.read().decode()).get('ok'):
+                        log('instance déjà active sur ce port — SORTIE DURE (anti-doublon).')
+                        os._exit(4)
+            except Exception:
+                pass
+            time.sleep(1)
     log(f'A6-Router v{(read_version().get("version") or "?")} sur http://{bind_host}:{port} | modeles: {MODELS}')
     log(f"prix marché rafraîchis toutes les ~{CFG['market_ttl_s']}s (par requête), sondes toutes les {CFG['probe_interval_s']}s")
     log('base_url Hermes: http://127.0.0.1:%d/v1  |  model: auto' % port)
