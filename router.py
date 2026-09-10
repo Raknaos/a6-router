@@ -965,13 +965,47 @@ class Handler(BaseHTTPRequestHandler):
             return
         candidates, scored = live_candidates(requested)
         if not candidates:
-            with LOCK:
-                soon = min([round(u - time.time()) for (u, _r) in dict(COOLDOWN).values()
-                            if u > time.time()] or [60])
-            self._json(503, {'error': {'message': 'aucun modele disponible (cooldowns ou marche inaccessible)',
-                                       'type': 'server_error', 'code': 'no_model_available',
-                                       'hint': f'reessayez dans ~{soon}s'}})
-            return
+            # ── v2.2.1 ANTI-503-INSTANTANÉ (10-09-2026) ──────────────────────────────
+            # « tous les canaux en cooldown » n'est PAS une panne : au même instant le
+            # marché répond souvent 200 en direct (mesuré 6/6 le 10-09 à 09:2x alors que
+            # le routeur refusait en 2 ms). Un 503 instantané tue le tour ENTIER d'un
+            # agent (rapport, tâche longue) ; on préfère ATTENDRE la fin du cooldown le
+            # plus proche (borné par cooldown_wait_max_s) et retenter le routage normal.
+            wait_max = float(CFG.get('cooldown_wait_max_s', 30) or 30)
+            t_dead = time.time() + wait_max
+            while not candidates:
+                with LOCK:
+                    ups = [u for (u, _r) in dict(COOLDOWN).values() if u > time.time()]
+                    soon = min([u - time.time() for u in ups] or [wait_max + 1])
+                if not ups or soon > wait_max or time.time() >= t_dead:
+                    break
+                log(f'ATTENTE cooldown {round(soon, 1)}s avant nouvel essai (anti-503-instantane)')
+                time.sleep(min(max(soon, 0.25), 5.0))
+                candidates, scored = live_candidates(requested)
+            if not candidates:
+                # DERNIER RECOURS : le canal le moins cher malgré son cooldown — un essai
+                # réel vaut mieux qu'un refus sec (le cooldown est un compteur interne,
+                # pas une preuve que l'amont est mort).
+                lr = []
+                for m in MODELS:
+                    b = (market_get(m) or {}).get('best')
+                    if not b:
+                        continue
+                    s_ok = max(float(b.get('success', 100) or 100) / 100.0, 0.01)
+                    lr.append(((b.get('in', 0) + b.get('out', 0)) / 2 / s_ok, m))
+                lr.sort(key=lambda x: x[0])
+                if lr:
+                    candidates = [lr[0][1]]
+                    scored = []
+                    log(f'DERNIER RECOURS {lr[0][1]} (cooldown ignoré) — essai unique')
+            if not candidates:
+                with LOCK:
+                    soon = min([round(u - time.time()) for (u, _r) in dict(COOLDOWN).values()
+                                if u > time.time()] or [60])
+                self._json(503, {'error': {'message': 'aucun modele disponible (cooldowns ou marche inaccessible)',
+                                           'type': 'server_error', 'code': 'no_model_available',
+                                           'hint': f'reessayez dans ~{soon}s'}})
+                return
         req_id = uuid.uuid4().hex[:12]
         last_err = None
         for i, model_id in enumerate(candidates[:4]):
