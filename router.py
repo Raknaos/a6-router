@@ -454,7 +454,27 @@ def probe_loop():
 
 # ---------------- Sélection temps réel ----------------
 
-def live_candidates(requested_model):
+# ── Cache prompt : critère INDISPENSABLE du choix (11-09) ───────────────────
+# Certains canaux amont ne proposent PAS de cache prompt. Sans cache, chaque tour
+# d'une conversation repaie l'input au prix plein (au lieu de ~0,1x). Dès qu'une
+# requête porte un vrai contexte, les canaux sans cache sont écartés du choix
+# tant qu'un canal cache-capable existe dans le pool.
+CACHE_MIN_TOKENS = 1500
+
+def has_cache(b):
+    """Le canal propose-t-il un VRAI cache prompt ? (remise cache_read effective
+    ou hit constaté ≥ 30 %)."""
+    cr = b.get('cache_read') or 0
+    i = b.get('in') or 0
+    hit = b.get('cache_hit') or 0
+    if cr > 0 and i > 0 and cr <= 0.5 * i:
+        return True
+    try:
+        return float(hit) >= 0.30
+    except Exception:
+        return False
+
+def live_candidates(requested_model, tin_est=0):
     """Liste ordonnée de modèles candidats pour CETTE requête.
     Prix marché (cache frais) + latence = max(sonde, p50 marché). Cooldowns respectés.
     HYSTÉRÉSIS : le modèle élu courant (PIN) est retenu tant que le meilleur
@@ -487,6 +507,12 @@ def live_candidates(requested_model):
         else:
             cost_expected = (b['in'] + b['out']) / 2 / success
         cand.append((cost_expected, m, b))
+    # CACHE INDISPENSABLE (11-09) : un canal sans cache prompt est écarté dès que
+    # la requête porte un vrai contexte et qu'un canal cache-capable existe.
+    if (tin_est or 0) >= CACHE_MIN_TOKENS:
+        with_cache = [x for x in cand if has_cache(x[2])]
+        if with_cache:
+            cand = with_cache
     cand.sort(key=lambda x: x[0])
     # ── HYSTÉRÉSIS + RETENUE MINIMALE : le cache de prompts vaut plus qu'un gain
     #    de quelques pourcents. On garde le canal élu ; pendant pin_min_hold_s
@@ -1078,6 +1104,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {'error': {'message': f'bad request: {e}'}})
             return
         requested = payload.get('model', 'auto')
+        try:
+            tin_est = len(json.dumps(payload.get('messages') or [])) // 4
+        except Exception:
+            tin_est = 0
         # Compat OpenAI : un modèle inconnu (ni 'auto' ni dans MODELS) -> 404 clair,
         # pas un 200 silencieux routé vers un autre modèle (casse les SDK)
         if requested != 'auto' and requested not in MODELS:
@@ -1098,7 +1128,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {'error': {'message': f'n={n_c} non supporté (seul n=1) — le routeur ne duplique pas les requêtes',
                                        'type': 'invalid_request_error', 'code': 'unsupported_n'}})
             return
-        candidates, scored = live_candidates(requested)
+        candidates, scored = live_candidates(requested, tin_est)
         if not candidates:
             # ── v2.2.1 ANTI-503-INSTANTANÉ (10-09-2026) ──────────────────────────────
             # « tous les canaux en cooldown » n'est PAS une panne : au même instant le
@@ -1130,7 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
                     # chargé (constaté sur Obra après chaque redémarrage : 503 en 1 ms).
                     log('ATTENTE du marché (cache de prix vide) avant refus')
                     time.sleep(1.0)
-                candidates, scored = live_candidates(requested)
+                candidates, scored = live_candidates(requested, tin_est)
             if not candidates:
                 # DERNIER RECOURS : le canal le moins cher malgré son cooldown — un essai
                 # réel vaut mieux qu'un refus sec (le cooldown est un compteur interne,
